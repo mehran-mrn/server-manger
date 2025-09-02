@@ -104,10 +104,14 @@ send_log "step" "3" "Generated UUID"
 # ---------- firewall: try ufw or iptables fallback ----------
 send_log "step" "9" "Configuring firewall (allow port ${PORT})"
 if command -v ufw >/dev/null 2>&1; then
+  send_log "step" "2" "Configuring firewall (allow port 80, 443, 22, 16823)"
+  ufw allow 80/tcp || true
+  ufw allow 443/tcp || true
+  ufw allow 22/tcp || true
+  ufw allow 16823/tcp || true
   ufw allow "${PORT}/tcp" || send_log "step" "9" "ufw allow failed (maybe ufw inactive)"
-  ufw allow "80/tcp" || send_log "step" "9" "ufw allow failed port 80 (maybe ufw inactive)"
-  ufw allow "443/tcp" || send_log "step" "9" "ufw allow failed port 443 (maybe ufw inactive)"
-  ufw reload
+  ufw --force enable || true
+  ufw reload || true
 else
   # add a basic iptables accept rule (non-persistent)
   iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables rule add failed"
