@@ -256,7 +256,8 @@ if [[ "$USED_MODE" == stealth* ]]; then
 else
   SCHEME="vless://${UUID}@${ADDR}:${PORT}?type=tcp&encryption=none#${HOSTNAME}"
 fi
-send_log "step" "11" "`${SCHEME}`"
+
+send_log "step" "11" "${SCHEME}"
 
 python3 - <<PY > "${CLIENT_FILE}"
 import json
