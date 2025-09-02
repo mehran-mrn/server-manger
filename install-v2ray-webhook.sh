@@ -101,46 +101,83 @@ bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/mast
 UUID="$(cat /proc/sys/kernel/random/uuid)"
 send_log "step" "3" "Generated UUID"
 
-# ---------- obtain cert if domain+CF provided and mode requires stealth ----------
+# ---------- obtain cert if domain provided and mode requires stealth ----------
 CERT_KEY_PATH=""
 CERT_FULLCHAIN_PATH=""
+CERT_SUCCESS="false"
+
 if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
-  if [ -n "$DOMAIN" ] && [ -n "$CF_API_TOKEN" ]; then
-    send_log "step" "4" "Attempting to obtain TLS cert with acme.sh using Cloudflare DNS"
+  if [ -n "$DOMAIN" ]; then
+    send_log "step" "4" "Attempting to obtain TLS cert with acme.sh using HTTP-01 challenge"
+    
     # install acme.sh if missing
     if [ ! -x "$ACME_SH" ]; then
-      curl -sSfL https://get.acme.sh | sh || { send_log "error" "4" "acme.sh install failed"; }
+      curl -sSfL https://get.acme.sh | sh || { 
+        send_log "step" "4" "acme.sh install failed, falling back to non-TLS"
+        CERT_SUCCESS="false"
+      }
     fi
-    export CF_Token="$CF_API_TOKEN"
-    export CF_Zone="$CF_ZONE_ID"
-    # issue cert (dns)
-    /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --yes-I-know-dns-manual-mode || {
-      # try with default installation path
-      /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" || send_log "step" "4" "acme.sh issue may have failed; continuing in non-TLS mode"
-    }
-    # install cert to /etc/ssl/v2ray-<runid> if exists
-    if /root/.acme.sh/acme.sh --list | grep -q "$DOMAIN"; then
-      mkdir -p /etc/ssl/v2ray-$RUN_ID
-      /root/.acme.sh/acme.sh --installcert -d "$DOMAIN" \
-        --fullchain-file /etc/ssl/v2ray-$RUN_ID/fullchain.pem \
-        --key-file /etc/ssl/v2ray-$RUN_ID/key.pem || send_log "step" "4" "acme.sh installcert failed"
-      CERT_FULLCHAIN_PATH="/etc/ssl/v2ray-$RUN_ID/fullchain.pem"
-      CERT_KEY_PATH="/etc/ssl/v2ray-$RUN_ID/key.pem"
-      send_log "step" "4" "Certificate installed: $CERT_FULLCHAIN_PATH"
+    
+    # Only proceed if acme.sh is available
+    if [ -x "$ACME_SH" ]; then
+      # Stop any service using port 80
+      systemctl stop apache2 2>/dev/null || true
+      systemctl stop nginx 2>/dev/null || true
+      pkill -f "python.*SimpleHTTP" 2>/dev/null || true
+      
+      # Issue cert using standalone mode (acme.sh handles the web server)
+      $ACME_SH --issue -d "$DOMAIN" --standalone --httpport 80 --force && CERT_SUCCESS="true" || {
+        send_log "step" "4" "HTTP-01 challenge failed, falling back to non-TLS"
+        CERT_SUCCESS="false"
+      }
+      
+      # Install cert if successful
+      if [ "$CERT_SUCCESS" = "true" ]; then
+        mkdir -p /etc/ssl/v2ray-$RUN_ID
+        $ACME_SH --installcert -d "$DOMAIN" \
+          --fullchain-file /etc/ssl/v2ray-$RUN_ID/fullchain.pem \
+          --key-file /etc/ssl/v2ray-$RUN_ID/key.pem && {
+          CERT_FULLCHAIN_PATH="/etc/ssl/v2ray-$RUN_ID/fullchain.pem"
+          CERT_KEY_PATH="/etc/ssl/v2ray-$RUN_ID/key.pem"
+          send_log "step" "4" "Certificate successfully installed: $CERT_FULLCHAIN_PATH"
+        } || {
+          send_log "step" "4" "Certificate install failed, falling back to non-TLS"
+          CERT_SUCCESS="false"
+          CERT_FULLCHAIN_PATH=""
+          CERT_KEY_PATH=""
+        }
+      fi
+      
+      # Verify certificate files exist and are readable
+      if [ "$CERT_SUCCESS" = "true" ]; then
+        if [ ! -f "$CERT_FULLCHAIN_PATH" ] || [ ! -f "$CERT_KEY_PATH" ]; then
+          send_log "step" "4" "Certificate files not found, falling back to non-TLS"
+          CERT_SUCCESS="false"
+          CERT_FULLCHAIN_PATH=""
+          CERT_KEY_PATH=""
+        fi
+      fi
     else
-      send_log "step" "4" "Certificate not issued; will fall back to non-TLS config"
-      CERT_FULLCHAIN_PATH=""; CERT_KEY_PATH=""
+      send_log "step" "4" "acme.sh not available, falling back to non-TLS"
+      CERT_SUCCESS="false"
     fi
   else
-    send_log "step" "4" "Skipping cert issuance (DOMAIN or CF_API_TOKEN missing)"
+    send_log "step" "4" "Skipping cert issuance (DOMAIN not provided)"
+    CERT_SUCCESS="false"
   fi
+else
+  send_log "step" "4" "Skipping cert issuance (mode is simple)"
+  CERT_SUCCESS="false"
 fi
 
 # ---------- write v2ray config ----------
 CONFIG_PATH="/usr/local/etc/v2ray/config.json"
 send_log "step" "5" "Writing v2ray config to $CONFIG_PATH"
 
-if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
+# Create log directory
+mkdir -p /var/log/v2ray
+
+if [ "$CERT_SUCCESS" = "true" ] && [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
   # stealth: vless over websocket + tls (server uses provided cert)
   cat > "$CONFIG_PATH" <<EOF
 {
@@ -165,6 +202,7 @@ if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
 }
 EOF
   USED_MODE="stealth (vless+ws+tls)"
+  send_log "step" "5" "Config written with TLS enabled (mode: $USED_MODE)"
 else
   # simple: vless tcp no-tls (fallback)
   cat > "$CONFIG_PATH" <<EOF
@@ -186,6 +224,7 @@ else
 }
 EOF
   USED_MODE="simple (vless+tcp+none)"
+  send_log "step" "5" "Config written without TLS (mode: $USED_MODE)"
 fi
 
 send_log "step" "6" "Config written (mode: $USED_MODE)"
