@@ -1,197 +1,282 @@
 #!/usr/bin/env bash
-# install-v2ray-webhook.sh
-# Usage:
-#   sudo ./install-v2ray-webhook.sh --webhook-url "https://your-n8n.example/webhook/receive" \
-#       [--webhook-secret SECRET] [--domain example.com] [--cf-zone-id ZONEID] [--cf-api-token TOKEN] [--port 16823] [--run-id ID]
-#
-# Notes:
-#  - Port defaults to 16823 (fixed, as requested).
-#  - If --domain and Cloudflare info provided, script will attempt to update A record.
-#  - Script will POST JSON logs to WEBHOOK_URL. If WEBHOOK_SECRET set, it will send header X-Setup-Token: <secret>.
-#
+# install-v2ray-webhook.sh (revised)
+# Usage example:
+# sudo ./install-v2ray-webhook.sh \
+#   --webhook-url "https://n8n.example/webhook/receive" \
+#   --webhook-user "botuser" --webhook-pass "botpass" \
+#   --domain "s1.oiix.ir" --cf-zone-id "ZONEID" --cf-api-token "CFTOKEN" \
+#   --cf-proxied "false" --port 16823
 set -euo pipefail
 
-# --------- parse args ----------
+# -------- defaults ----------
 WEBHOOK_URL=""
-WEBHOOK_SECRET=""
+WEBHOOK_USER=""
+WEBHOOK_PASS=""
+WEBHOOK_SECRET=""    # optional header token legacy
 DOMAIN=""
 CF_ZONE_ID=""
 CF_API_TOKEN=""
+CF_PROXIED="false"
 PORT="16823"
 RUN_ID=""
+MODE="auto"   # auto | simple | stealth
+DEPS="curl wget unzip ca-certificates python3 jq openssl socat"
+ACME_SH="/root/.acme.sh/acme.sh"
+
+# -------- parse args ----------
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --webhook-url) WEBHOOK_URL="$2"; shift 2;;
+    --webhook-user) WEBHOOK_USER="$2"; shift 2;;
+    --webhook-pass) WEBHOOK_PASS="$2"; shift 2;;
     --webhook-secret) WEBHOOK_SECRET="$2"; shift 2;;
     --domain) DOMAIN="$2"; shift 2;;
     --cf-zone-id) CF_ZONE_ID="$2"; shift 2;;
     --cf-api-token) CF_API_TOKEN="$2"; shift 2;;
+    --cf-proxied) CF_PROXIED="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
     --run-id) RUN_ID="$2"; shift 2;;
-    -h|--help) echo "Usage: $0 --webhook-url <url> [--webhook-secret <secret>] [--domain ...]"; exit 0;;
+    --mode) MODE="$2"; shift 2;; # auto/simple/stealth
+    -h|--help) echo "Usage: $0 --webhook-url <url> [--webhook-user user --webhook-pass pass] [--domain ...]"; exit 0;;
     *) echo "Unknown arg: $1"; exit 2;;
   esac
 done
 
 if [ -z "$WEBHOOK_URL" ]; then
-  echo "ERROR: --webhook-url is required"
-  exit 1
+  echo "ERROR: --webhook-url is required"; exit 1
 fi
-
-if [ "$EUID" -ne 0 ]; then
-  echo "ERROR: must run as root"
-  exit 1
-fi
-
-if [ -z "$RUN_ID" ]; then
-  RUN_ID="$(date +%s)-$RANDOM"
-fi
-
+if [ "$EUID" -ne 0 ]; then echo "ERROR: run as root"; exit 1; fi
+if [ -z "$RUN_ID" ]; then RUN_ID="$(date +%s)-$RANDOM"; fi
 HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
 
-# --------- helper: send log to webhook (uses python3 to produce safe JSON) ----------
+# -------- helper: send log to webhook ----------
 send_log(){
-  local STATUS="$1"   # e.g., starting, step, success, error
-  local STEP="$2"     # numeric or short name
-  local MESSAGE="$3"
+  local STATUS="$1"; local STEP="$2"; local MESSAGE="$3"
   local TS="$(date -u +%FT%TZ)"
-
-  # Build JSON payload using python3 for safe escaping
   PAYLOAD="$(python3 - <<PY
 import json,sys
-obj = {
-  "run_id": "$RUN_ID",
-  "host": "$HOSTNAME",
-  "status": "$STATUS",
-  "step": "$STEP",
-  "message": "$MESSAGE",
-  "timestamp": "$TS",
-  "port": "$PORT",
-  "domain": "$DOMAIN"
-}
-print(json.dumps(obj))
+print(json.dumps({
+  "run_id":"$RUN_ID",
+  "host":"$HOSTNAME",
+  "status":"$STATUS",
+  "step":"$STEP",
+  "message":"$MESSAGE",
+  "timestamp":"$TS",
+  "port":"$PORT",
+  "domain":"$DOMAIN"
+}))
 PY
 )"
-  # send (don't fail the whole script if webhook is unreachable; just warn)
-  if [ -n "$WEBHOOK_SECRET" ]; then
+  # choose curl auth
+  if [ -n "$WEBHOOK_USER" ] && [ -n "$WEBHOOK_PASS" ]; then
+    curl -sS -u "$WEBHOOK_USER:$WEBHOOK_PASS" -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$PAYLOAD" || echo "WARN: webhook POST failed"
+  elif [ -n "$WEBHOOK_SECRET" ]; then
     curl -sS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-Setup-Token: $WEBHOOK_SECRET" -d "$PAYLOAD" || echo "WARN: webhook POST failed"
   else
     curl -sS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$PAYLOAD" || echo "WARN: webhook POST failed"
   fi
-
-  # also echo locally
   echo "[$TS] [$STATUS] step=$STEP: $MESSAGE"
 }
 
-# Start
+# error trap to report failure
+on_error(){
+  local rc=$?
+  send_log "error" "fatal" "Script exited with code $rc"
+  exit $rc
+}
+trap on_error ERR
+
 send_log "starting" "0" "Setup started (run_id=$RUN_ID)"
 
-send_log "step" "1" "Updating package lists and installing prerequisites"
+# ---------- install deps ----------
+send_log "step" "1" "Updating packages and installing prerequisites"
 apt-get update -y
-DEPS="curl wget unzip ca-certificates python3"
-apt-get install -y $DEPS
+apt-get install -y $DEPS || { send_log "error" "1" "Failed to install packages"; exit 1; }
 
-send_log "step" "2" "Downloading and running official fhs-install-v2ray install-release.sh"
-# Using the official fhs-install script from v2fly (non-docker, systemd-friendly)
-bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh) || {
-  send_log "error" "2" "Failed to run install-release.sh"; exit 1;
-}
-send_log "step" "3" "fhs-install script completed"
+# ---------- install v2ray using fhs-install (official) ----------
+send_log "step" "2" "Installing v2ray (fhs-install-v2ray)"
+bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh) || { send_log "error" "2" "v2ray install failed"; exit 1; }
 
-# generate UUID for client
+# ---------- create uuid ----------
 UUID="$(cat /proc/sys/kernel/random/uuid)"
-send_log "step" "4" "Generated UUID: $UUID"
+send_log "step" "3" "Generated UUID"
 
-# Write a minimal v2ray config (VLESS TCP no-TLS on fixed port)
-send_log "step" "5" "Writing /usr/local/etc/v2ray/config.json"
-cat > /usr/local/etc/v2ray/config.json <<EOF
+# ---------- obtain cert if domain+CF provided and mode requires stealth ----------
+CERT_KEY_PATH=""
+CERT_FULLCHAIN_PATH=""
+if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
+  if [ -n "$DOMAIN" ] && [ -n "$CF_API_TOKEN" ]; then
+    send_log "step" "4" "Attempting to obtain TLS cert with acme.sh using Cloudflare DNS"
+    # install acme.sh if missing
+    if [ ! -x "$ACME_SH" ]; then
+      curl -sSfL https://get.acme.sh | sh || { send_log "error" "4" "acme.sh install failed"; }
+    fi
+    export CF_Token="$CF_API_TOKEN"
+    export CF_Zone="$CF_ZONE_ID"
+    # issue cert (dns)
+    /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --yes-I-know-dns-manual-mode || {
+      # try with default installation path
+      /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" || send_log "step" "4" "acme.sh issue may have failed; continuing in non-TLS mode"
+    }
+    # install cert to /etc/ssl/v2ray-<runid> if exists
+    if /root/.acme.sh/acme.sh --list | grep -q "$DOMAIN"; then
+      mkdir -p /etc/ssl/v2ray-$RUN_ID
+      /root/.acme.sh/acme.sh --installcert -d "$DOMAIN" \
+        --fullchain-file /etc/ssl/v2ray-$RUN_ID/fullchain.pem \
+        --key-file /etc/ssl/v2ray-$RUN_ID/key.pem || send_log "step" "4" "acme.sh installcert failed"
+      CERT_FULLCHAIN_PATH="/etc/ssl/v2ray-$RUN_ID/fullchain.pem"
+      CERT_KEY_PATH="/etc/ssl/v2ray-$RUN_ID/key.pem"
+      send_log "step" "4" "Certificate installed: $CERT_FULLCHAIN_PATH"
+    else
+      send_log "step" "4" "Certificate not issued; will fall back to non-TLS config"
+      CERT_FULLCHAIN_PATH=""; CERT_KEY_PATH=""
+    fi
+  else
+    send_log "step" "4" "Skipping cert issuance (DOMAIN or CF_API_TOKEN missing)"
+  fi
+fi
+
+# ---------- write v2ray config ----------
+CONFIG_PATH="/usr/local/etc/v2ray/config.json"
+send_log "step" "5" "Writing v2ray config to $CONFIG_PATH"
+
+if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
+  # stealth: vless over websocket + tls (server uses provided cert)
+  cat > "$CONFIG_PATH" <<EOF
 {
-  "log": {
-    "access": "/var/log/v2ray/access.log",
-    "error": "/var/log/v2ray/error.log",
-    "loglevel": "warning"
-  },
+  "log": {"access": "/var/log/v2ray/access.log","error": "/var/log/v2ray/error.log","loglevel": "warning"},
   "inbounds": [{
     "port": ${PORT},
     "protocol": "vless",
     "settings": {
-      "clients": [{ "id": "${UUID}", "level": 0, "email": "user@local" }],
-      "decryption": "none"
+      "clients": [{"id":"${UUID}","level":0,"email":"user@local"}],
+      "decryption":"none"
+    },
+    "streamSettings": {
+      "network": "ws",
+      "security": "tls",
+      "tlsSettings": {
+        "certificates": [{"certificateFile":"${CERT_FULLCHAIN_PATH}","keyFile":"${CERT_KEY_PATH}"}]
+      },
+      "wsSettings": { "path": "/" }
+    }
+  }],
+  "outbounds": [{"protocol":"freedom"}]
+}
+EOF
+  USED_MODE="stealth (vless+ws+tls)"
+else
+  # simple: vless tcp no-tls (fallback)
+  cat > "$CONFIG_PATH" <<EOF
+{
+  "log": {"access": "/var/log/v2ray/access.log","error": "/var/log/v2ray/error.log","loglevel": "warning"},
+  "inbounds": [{
+    "port": ${PORT},
+    "protocol": "vless",
+    "settings": {
+      "clients": [{"id":"${UUID}","level":0,"email":"user@local"}],
+      "decryption":"none"
     },
     "streamSettings": {
       "network": "tcp",
       "security": "none"
     }
   }],
-  "outbounds": [{ "protocol": "freedom" }]
+  "outbounds": [{"protocol":"freedom"}]
 }
 EOF
+  USED_MODE="simple (vless+tcp+none)"
+fi
 
-send_log "step" "6" "Config file written"
+send_log "step" "6" "Config written (mode: $USED_MODE)"
 
+# ---------- enable & start service ----------
 send_log "step" "7" "Enabling and starting v2ray service"
 systemctl daemon-reload
-systemctl enable --now v2ray || {
-  send_log "error" "7" "Failed to start v2ray service"; exit 1;
-}
-sleep 2
+systemctl enable --now v2ray || { send_log "error" "7" "Failed to start v2ray"; }
 
-# verify service listening
-if ss -ltnp | grep -q ":${PORT}[[:space:]]"; then
-  send_log "step" "8" "Service listening on port ${PORT}"
+sleep 2
+# verify listening
+if ss -ltnp 2>/dev/null | grep -q ":${PORT}[[:space:]]"; then
+  send_log "step" "8" "v2ray is listening on port ${PORT}"
 else
-  send_log "error" "8" "Service not listening on port ${PORT} -- check logs /var/log/v2ray"
-  # proceed but mark as error
+  send_log "error" "8" "Service not listening on port ${PORT}"
 fi
 
-# Get public IP
-MYIP="$(curl -s https://ipv4.icanhazip.com | tr -d '\n')"
-send_log "step" "9" "Detected public IP: $MYIP"
+# ---------- firewall: try ufw or iptables fallback ----------
+send_log "step" "9" "Configuring firewall (allow port ${PORT})"
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow "${PORT}/tcp" || send_log "step" "9" "ufw allow failed (maybe ufw inactive)"
+else
+  # add a basic iptables accept rule (non-persistent)
+  iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables rule add failed"
+fi
 
-# Optional: update Cloudflare DNS if zone & token given
+# ---------- detect public IP ----------
+MYIP="$(curl -s https://ipv4.icanhazip.com | tr -d '\n' || true)"
+send_log "step" "10" "Public IP detected: ${MYIP}"
+
+# ---------- update Cloudflare DNS if requested ----------
 if [ -n "$DOMAIN" ] && [ -n "$CF_ZONE_ID" ] && [ -n "$CF_API_TOKEN" ]; then
-  send_log "step" "10" "Updating Cloudflare DNS for ${DOMAIN}"
-  # find record id
+  send_log "step" "11" "Updating Cloudflare DNS for ${DOMAIN} (proxied=${CF_PROXIED})"
   GET_REC="$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${DOMAIN}" \
     -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json")"
-  RECORD_ID="$(echo "$GET_REC" | python3 -c "import sys,json; j=json.load(sys.stdin); r=j.get('result'); print(r[0]['id'] if r else '')" 2>/dev/null || true)"
+  RECORD_ID="$(echo "$GET_REC" | jq -r '.result[0].id // empty')"
   if [ -n "$RECORD_ID" ]; then
-    send_log "step" "11" "Found existing record id=${RECORD_ID}, updating to ${MYIP}"
     curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
       -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
-      --data "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${MYIP}\",\"ttl\":120,\"proxied\":false}" >/dev/null || {
-        send_log "error" "11" "Cloudflare update PUT failed"
-      }
+      --data "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${MYIP}\",\"ttl\":120,\"proxied\":${CF_PROXIED}}" >/dev/null || send_log "error" "11" "Cloudflare update PUT failed"
+    send_log "step" "11" "Updated existing record id=${RECORD_ID}"
   else
-    send_log "step" "11" "No existing record, creating A record ${DOMAIN} -> ${MYIP}"
     curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
       -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
-      --data "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${MYIP}\",\"ttl\":120,\"proxied\":false}" >/dev/null || {
-        send_log "error" "11" "Cloudflare create POST failed"
-      }
+      --data "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${MYIP}\",\"ttl\":120,\"proxied\":${CF_PROXIED}}" >/dev/null || send_log "error" "11" "Cloudflare create POST failed"
+    send_log "step" "11" "Created A record ${DOMAIN} -> ${MYIP}"
   fi
 else
-  send_log "step" "10" "Skipping Cloudflare DNS (CF_ZONE_ID or CF_API_TOKEN or DOMAIN missing)"
+  send_log "step" "11" "Skipping Cloudflare update (domain/zone/token missing)"
 fi
 
-# Final report
+# ---------- write client info file ----------
+CLIENT_FILE="/root/vpn-client-${RUN_ID}.json"
+python3 - <<PY > "${CLIENT_FILE}"
+import json
+obj = {
+  "run_id":"${RUN_ID}",
+  "host":"${HOSTNAME}",
+  "ip":"${MYIP}",
+  "port":"${PORT}",
+  "uuid":"${UUID}",
+  "mode":"${USED_MODE}",
+  "domain":"${DOMAIN}",
+  "cert_fullchain":"${CERT_FULLCHAIN_PATH}",
+  "cert_key":"${CERT_KEY_PATH}"
+}
+print(json.dumps(obj, indent=2))
+PY
+chmod 600 "${CLIENT_FILE}"
+send_log "step" "12" "Wrote client info to ${CLIENT_FILE}"
+
+# ---------- final webhook ----------
 FINAL_PAYLOAD="$(python3 - <<PY
 import json
 print(json.dumps({
-  "run_id": "$RUN_ID",
-  "host": "$HOSTNAME",
-  "status": "finished",
-  "message": "Installation finished",
-  "timestamp": "$(date -u +%FT%TZ)",
-  "ip": "$MYIP",
-  "port": "$PORT",
-  "uuid": "$UUID",
-  "domain": "$DOMAIN"
+  "run_id":"$RUN_ID",
+  "host":"$HOSTNAME",
+  "status":"finished",
+  "message":"Installation finished",
+  "timestamp":"$(date -u +%FT%TZ)",
+  "ip":"$MYIP",
+  "port":"$PORT",
+  "uuid":"$UUID",
+  "domain":"$DOMAIN",
+  "mode":"$USED_MODE"
 }))
 PY
 )"
-# send final
-if [ -n "$WEBHOOK_SECRET" ]; then
+if [ -n "$WEBHOOK_USER" ] && [ -n "$WEBHOOK_PASS" ]; then
+  curl -sS -u "$WEBHOOK_USER:$WEBHOOK_PASS" -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$FINAL_PAYLOAD" || echo "WARN: final webhook POST failed"
+elif [ -n "$WEBHOOK_SECRET" ]; then
   curl -sS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-Setup-Token: $WEBHOOK_SECRET" -d "$FINAL_PAYLOAD" || echo "WARN: final webhook POST failed"
 else
   curl -sS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$FINAL_PAYLOAD" || echo "WARN: final webhook POST failed"
@@ -201,3 +286,4 @@ echo "=== DONE ==="
 echo "UUID: ${UUID}"
 echo "PORT: ${PORT}"
 echo "IP: ${MYIP}"
+echo "Client file: ${CLIENT_FILE}"
