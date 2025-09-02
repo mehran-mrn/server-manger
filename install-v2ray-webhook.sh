@@ -155,10 +155,14 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
       pkill -f "python.*SimpleHTTP" 2>/dev/null || true
       
       # Issue cert using standalone mode (acme.sh handles the web server)
-      $ACME_SH --register-account -m mehranmarandi90@gmail.com --server https://acme-v02.api.letsencrypt.org/directory
-      $ACME_SH --issue -d "$DOMAIN" --standalone --httpport 80 --force --server https://acme-v02.api.letsencrypt.org/directory 
-      CERT_FULLCHAIN_PATH="/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
-      CERT_KEY_PATH="/root/.acme.sh/${DOMAIN}_ecc/${DOMAIN}.key"
+      if [ -x "$ACME_SH" ]; then
+        $ACME_SH --register-account -m mehranmarandi90@gmail.com --server https://acme-v02.api.letsencrypt.org/directory || CERT_SUCCESS="false"
+        $ACME_SH --issue -d "$DOMAIN" --standalone --httpport 80 --force --server https://acme-v02.api.letsencrypt.org/directory || CERT_SUCCESS="false"
+        CERT_FULLCHAIN_PATH="/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
+        CERT_KEY_PATH="/root/.acme.sh/${DOMAIN}_ecc/${DOMAIN}.key"
+      else
+        CERT_SUCCESS="false"
+      fi
 
       if [ -f "$CERT_FULLCHAIN_PATH" ] && [ -f "$CERT_KEY_PATH" ]; then
           CERT_SUCCESS="true"
