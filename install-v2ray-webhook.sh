@@ -101,6 +101,31 @@ bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/mast
 UUID="$(cat /proc/sys/kernel/random/uuid)"
 send_log "step" "3" "Generated UUID"
 
+# ---------- firewall: try ufw or iptables fallback ----------
+send_log "step" "9" "Configuring firewall (allow port ${PORT})"
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow "${PORT}/tcp" || send_log "step" "9" "ufw allow failed (maybe ufw inactive)"
+  ufw allow "80/tcp" || send_log "step" "9" "ufw allow failed port 80 (maybe ufw inactive)"
+  ufw allow "443/tcp" || send_log "step" "9" "ufw allow failed port 443 (maybe ufw inactive)"
+else
+  # add a basic iptables accept rule (non-persistent)
+  iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables rule add failed"
+  iptables -I INPUT -p tcp --dport 80 -j ACCEPT || send_log "step" "9" "iptables rule port 80 add failed"
+iptables -I INPUT -p tcp --dport 443 -j ACCEPT || send_log "step" "9" "iptables rule port 443 add failed"
+fi
+# add iptables rules
+
+iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables INPUT rule add failed"
+iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -C FORWARD -s 0.0.0.0/0 -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -s 0.0.0.0/0 -j ACCEPT
+# enable ip_forward
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
 # ---------- obtain cert if domain provided and mode requires stealth ----------
 CERT_KEY_PATH=""
 CERT_FULLCHAIN_PATH=""
@@ -242,30 +267,6 @@ else
   send_log "error" "8" "Service not listening on port ${PORT}"
 fi
 
-# ---------- firewall: try ufw or iptables fallback ----------
-send_log "step" "9" "Configuring firewall (allow port ${PORT})"
-if command -v ufw >/dev/null 2>&1; then
-  ufw allow "${PORT}/tcp" || send_log "step" "9" "ufw allow failed (maybe ufw inactive)"
-  ufw allow "80/tcp" || send_log "step" "9" "ufw allow failed port 80 (maybe ufw inactive)"
-  ufw allow "443/tcp" || send_log "step" "9" "ufw allow failed port 443 (maybe ufw inactive)"
-else
-  # add a basic iptables accept rule (non-persistent)
-  iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables rule add failed"
-  iptables -I INPUT -p tcp --dport 80 -j ACCEPT || send_log "step" "9" "iptables rule port 80 add failed"
-iptables -I INPUT -p tcp --dport 443 -j ACCEPT || send_log "step" "9" "iptables rule port 443 add failed"
-fi
-# add iptables rules
-
-iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables INPUT rule add failed"
-iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || \
-  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-  iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-iptables -C FORWARD -s 0.0.0.0/0 -j ACCEPT 2>/dev/null || \
-  iptables -A FORWARD -s 0.0.0.0/0 -j ACCEPT
-# enable ip_forward
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
-grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
 # ---------- detect public IP ----------
 MYIP="$(curl -s https://ipv4.icanhazip.com | tr -d '\n' || true)"
