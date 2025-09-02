@@ -88,6 +88,35 @@ trap on_error ERR
 
 send_log "starting" "0" "Setup started (run_id=$RUN_ID)"
 
+# ---------- configure IP forwarding and routing ----------
+send_log "step" "0.5" "Configuring IP forwarding and routing for VPN traffic"
+# Enable IP forwarding
+echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+echo 'net.ipv6.conf.all.forwarding=1' >> /etc/sysctl.conf
+sysctl -p
+
+# Clear existing rules
+iptables -F
+iptables -t nat -F
+iptables -X 2>/dev/null || true
+
+# Configure NAT and forwarding rules
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -o ens3 -j MASQUERADE  # common interface name
+iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+iptables -A INPUT -p tcp --dport ${PORT} -j ACCEPT
+iptables -A INPUT -i lo -j ACCEPT
+
+# Make iptables rules persistent
+if command -v iptables-save >/dev/null 2>&1; then
+  iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+fi
+
+send_log "step" "0.5" "IP forwarding and NAT configured"
+
 # ---------- install deps ----------
 send_log "step" "1" "Updating packages and installing prerequisites"
 apt-get update -y
@@ -140,6 +169,9 @@ fi
 CONFIG_PATH="/usr/local/etc/v2ray/config.json"
 send_log "step" "5" "Writing v2ray config to $CONFIG_PATH"
 
+# Create log directory
+mkdir -p /var/log/v2ray
+
 if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
   # stealth: vless over websocket + tls (server uses provided cert)
   cat > "$CONFIG_PATH" <<EOF
@@ -161,10 +193,17 @@ if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
       "wsSettings": { "path": "/" }
     }
   }],
-  "outbounds": [{"protocol":"freedom"}]
+  "outbounds": [{"protocol":"freedom","settings":{},"tag":"direct"}],
+  "routing": {
+    "rules": [{"type": "field","outboundTag": "direct","network": "tcp,udp"}]
+  }
 }
 EOF
   USED_MODE="stealth (vless+ws+tls)"
+  CONNECTION_TYPE="vless"
+  SECURITY="tls"
+  NETWORK="ws"
+  PATH="/"
 else
   # simple: vless tcp no-tls (fallback)
   cat > "$CONFIG_PATH" <<EOF
@@ -182,10 +221,17 @@ else
       "security": "none"
     }
   }],
-  "outbounds": [{"protocol":"freedom"}]
+  "outbounds": [{"protocol":"freedom","settings":{},"tag":"direct"}],
+  "routing": {
+    "rules": [{"type": "field","outboundTag": "direct","network": "tcp,udp"}]
+  }
 }
 EOF
   USED_MODE="simple (vless+tcp+none)"
+  CONNECTION_TYPE="vless"
+  SECURITY="none"
+  NETWORK="tcp"
+  PATH=""
 fi
 
 send_log "step" "6" "Config written (mode: $USED_MODE)"
@@ -195,7 +241,7 @@ send_log "step" "7" "Enabling and starting v2ray service"
 systemctl daemon-reload
 systemctl enable --now v2ray || { send_log "error" "7" "Failed to start v2ray"; }
 
-sleep 2
+sleep 3
 # verify listening
 if ss -ltnp 2>/dev/null | grep -q ":${PORT}[[:space:]]"; then
   send_log "step" "8" "v2ray is listening on port ${PORT}"
@@ -207,13 +253,14 @@ fi
 send_log "step" "9" "Configuring firewall (allow port ${PORT})"
 if command -v ufw >/dev/null 2>&1; then
   ufw allow "${PORT}/tcp" || send_log "step" "9" "ufw allow failed (maybe ufw inactive)"
+  ufw allow ssh || true
 else
   # add a basic iptables accept rule (non-persistent)
   iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables rule add failed"
 fi
 
 # ---------- detect public IP ----------
-MYIP="$(curl -s https://ipv4.icanhazip.com | tr -d '\n' || true)"
+MYIP="$(curl -s https://ipv4.icanhazip.com | tr -d '\n' || curl -s https://ifconfig.me | tr -d '\n' || true)"
 send_log "step" "10" "Public IP detected: ${MYIP}"
 
 # ---------- update Cloudflare DNS if requested ----------
@@ -237,6 +284,47 @@ else
   send_log "step" "11" "Skipping Cloudflare update (domain/zone/token missing)"
 fi
 
+# ---------- generate connection strings ----------
+send_log "step" "12" "Generating connection strings"
+
+# Determine server address
+if [ -n "$DOMAIN" ]; then
+  SERVER_ADDR="$DOMAIN"
+else
+  SERVER_ADDR="$MYIP"
+fi
+
+# Generate VLESS connection string
+if [ "$SECURITY" = "tls" ]; then
+  # VLESS with TLS (WebSocket)
+  VLESS_STRING="vless://${UUID}@${SERVER_ADDR}:${PORT}?type=ws&security=tls&path=%2F#V2Ray-${RUN_ID}"
+else
+  # VLESS without TLS (TCP)
+  VLESS_STRING="vless://${UUID}@${SERVER_ADDR}:${PORT}?type=tcp&security=none#V2Ray-${RUN_ID}"
+fi
+
+# Generate VMess connection string (alternative format)
+VMESS_CONFIG="$(python3 - <<PY
+import json, base64
+config = {
+  "v": "2",
+  "ps": "V2Ray-${RUN_ID}",
+  "add": "${SERVER_ADDR}",
+  "port": "${PORT}",
+  "id": "${UUID}",
+  "aid": "0",
+  "net": "${NETWORK}",
+  "type": "none",
+  "host": "${SERVER_ADDR}" if "${DOMAIN}" else "",
+  "path": "${PATH}",
+  "tls": "${SECURITY}"
+}
+vmess_json = json.dumps(config, separators=(',', ':'))
+vmess_b64 = base64.b64encode(vmess_json.encode()).decode()
+print("vmess://" + vmess_b64)
+PY
+)"
+
 # ---------- write client info file ----------
 CLIENT_FILE="/root/vpn-client-${RUN_ID}.json"
 python3 - <<PY > "${CLIENT_FILE}"
@@ -250,30 +338,51 @@ obj = {
   "mode":"${USED_MODE}",
   "domain":"${DOMAIN}",
   "cert_fullchain":"${CERT_FULLCHAIN_PATH}",
-  "cert_key":"${CERT_KEY_PATH}"
+  "cert_key":"${CERT_KEY_PATH}",
+  "vless_string":"${VLESS_STRING}",
+  "vmess_string":"${VMESS_CONFIG}",
+  "server_address":"${SERVER_ADDR}",
+  "security":"${SECURITY}",
+  "network":"${NETWORK}",
+  "path":"${PATH}"
 }
 print(json.dumps(obj, indent=2))
 PY
 chmod 600 "${CLIENT_FILE}"
 send_log "step" "12" "Wrote client info to ${CLIENT_FILE}"
 
-# ---------- final webhook ----------
+# ---------- test v2ray service ----------
+send_log "step" "13" "Testing v2ray service status"
+if systemctl is-active --quiet v2ray; then
+  send_log "step" "13" "v2ray service is active and running"
+else
+  send_log "error" "13" "v2ray service is not running properly"
+  systemctl status v2ray || true
+fi
+
+# ---------- final webhook with connection strings ----------
 FINAL_PAYLOAD="$(python3 - <<PY
 import json
 print(json.dumps({
   "run_id":"$RUN_ID",
   "host":"$HOSTNAME",
   "status":"finished",
-  "message":"Installation finished",
+  "message":"Installation finished successfully",
   "timestamp":"$(date -u +%FT%TZ)",
   "ip":"$MYIP",
   "port":"$PORT",
   "uuid":"$UUID",
   "domain":"$DOMAIN",
-  "mode":"$USED_MODE"
+  "mode":"$USED_MODE",
+  "vless_connection":"$VLESS_STRING",
+  "vmess_connection":"$VMESS_CONFIG",
+  "server_address":"$SERVER_ADDR",
+  "security":"$SECURITY",
+  "network":"$NETWORK"
 }))
 PY
 )"
+
 if [ -n "$WEBHOOK_USER" ] && [ -n "$WEBHOOK_PASS" ]; then
   curl -sS -u "$WEBHOOK_USER:$WEBHOOK_PASS" -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$FINAL_PAYLOAD" || echo "WARN: final webhook POST failed"
 elif [ -n "$WEBHOOK_SECRET" ]; then
@@ -286,4 +395,11 @@ echo "=== DONE ==="
 echo "UUID: ${UUID}"
 echo "PORT: ${PORT}"
 echo "IP: ${MYIP}"
+echo "Domain: ${DOMAIN}"
 echo "Client file: ${CLIENT_FILE}"
+echo ""
+echo "=== CONNECTION STRINGS ==="
+echo "VLESS: ${VLESS_STRING}"
+echo "VMess: ${VMESS_CONFIG}"
+echo ""
+echo "Copy one of the above connection strings to your V2Ray client."
