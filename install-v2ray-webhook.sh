@@ -107,11 +107,12 @@ if command -v ufw >/dev/null 2>&1; then
   ufw allow "${PORT}/tcp" || send_log "step" "9" "ufw allow failed (maybe ufw inactive)"
   ufw allow "80/tcp" || send_log "step" "9" "ufw allow failed port 80 (maybe ufw inactive)"
   ufw allow "443/tcp" || send_log "step" "9" "ufw allow failed port 443 (maybe ufw inactive)"
+  ufw reload
 else
   # add a basic iptables accept rule (non-persistent)
   iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables rule add failed"
   iptables -I INPUT -p tcp --dport 80 -j ACCEPT || send_log "step" "9" "iptables rule port 80 add failed"
-iptables -I INPUT -p tcp --dport 443 -j ACCEPT || send_log "step" "9" "iptables rule port 443 add failed"
+  iptables -I INPUT -p tcp --dport 443 -j ACCEPT || send_log "step" "9" "iptables rule port 443 add failed"
 fi
 # add iptables rules
 
