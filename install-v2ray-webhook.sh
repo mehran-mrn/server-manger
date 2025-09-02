@@ -135,7 +135,7 @@ CERT_SUCCESS="false"
 if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
   if [ -n "$DOMAIN" ]; then
     send_log "step" "4" "Attempting to obtain TLS cert with acme.sh using HTTP-01 challenge"
-    send_log "step" "4" "3333333333"
+    send_log "step" "4" "ACME_SH $ACME_SH"
     # install acme.sh if missing
     if [ ! -x "$ACME_SH" ]; then
       curl -sSfL https://get.acme.sh | sh || { 
