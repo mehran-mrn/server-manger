@@ -144,6 +144,8 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
       }
     fi
     
+        send_log "step" "4" "Lind 1799 ACME_SH OK"
+
     # Only proceed if acme.sh is available
     if [ -x "$ACME_SH" ]; then
         send_log "step" "4" "Lind 149 ACME_SH OK"
