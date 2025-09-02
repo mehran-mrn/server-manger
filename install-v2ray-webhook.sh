@@ -149,7 +149,7 @@ if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
     "port": ${PORT},
     "protocol": "vless",
     "settings": {
-      "clients": [{"id":"${UUID}","level":0,"email":"user@local"}],
+      "clients": [{"id":"${UUID}","level":0,"email":"mehranmarandi90@gmail.com"}],
       "decryption":"none"
     },
     "streamSettings": {
@@ -174,7 +174,7 @@ else
     "port": ${PORT},
     "protocol": "vless",
     "settings": {
-      "clients": [{"id":"${UUID}","level":0,"email":"user@local"}],
+      "clients": [{"id":"${UUID}","level":0,"email":"mehranmarandi90@gmail.com"}],
       "decryption":"none"
     },
     "streamSettings": {
