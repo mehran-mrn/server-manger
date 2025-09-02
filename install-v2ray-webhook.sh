@@ -135,7 +135,7 @@ CERT_SUCCESS="false"
 if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
   if [ -n "$DOMAIN" ]; then
     send_log "step" "4" "Attempting to obtain TLS cert with acme.sh using HTTP-01 challenge"
-    
+    send_log "step" "4" "3333333333"
     # install acme.sh if missing
     if [ ! -x "$ACME_SH" ]; then
       curl -sSfL https://get.acme.sh | sh || { 
@@ -144,12 +144,11 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
       }
     fi
     
-      send_log "step" "4" "Lind 1799 ACME_SH OK"
+    send_log "step" "4" "Lind 1799 ACME_SH OK"
 
     # Only proceed if acme.sh is available
     if [ -x "$ACME_SH" ]; then
       send_log "step" "4" "Lind 149 ACME_SH OK"
-
       # Stop any service using port 80
       systemctl stop apache2 2>/dev/null || true
       systemctl stop nginx 2>/dev/null || true
