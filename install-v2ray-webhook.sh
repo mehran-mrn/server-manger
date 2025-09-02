@@ -284,7 +284,7 @@ print(json.dumps({
   "run_id":"$RUN_ID",
   "host":"$HOSTNAME",
   "status":"finished",
-  "message":"Installation finished",
+  "message":"Installation finished $SCHEME",
   "timestamp":"$(date -u +%FT%TZ)",
   "ip":"$MYIP",
   "port":"$PORT",
