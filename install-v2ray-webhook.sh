@@ -144,25 +144,25 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
       }
     fi
     
-        send_log "step" "4" "Lind 1799 ACME_SH OK"
+      send_log "step" "4" "Lind 1799 ACME_SH OK"
 
     # Only proceed if acme.sh is available
     if [ -x "$ACME_SH" ]; then
-        send_log "step" "4" "Lind 149 ACME_SH OK"
+      send_log "step" "4" "Lind 149 ACME_SH OK"
 
       # Stop any service using port 80
       systemctl stop apache2 2>/dev/null || true
       systemctl stop nginx 2>/dev/null || true
       pkill -f "python.*SimpleHTTP" 2>/dev/null || true
       
-              send_log "step" "4" "Lind 156 ACME_SH OK"
+      send_log "step" "4" "Lind 156 ACME_SH OK"
 
       # Issue cert using standalone mode (acme.sh handles the web server)
       $ACME_SH --register-account -m mehranmarandi90@gmail.com --server https://acme-v02.api.letsencrypt.org/directory
       $ACME_SH --issue -d "$DOMAIN" --standalone --httpport 80 --force --server https://acme-v02.api.letsencrypt.org/directory 
       CERT_FULLCHAIN_PATH="/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
       CERT_KEY_PATH="/root/.acme.sh/${DOMAIN}_ecc/${DOMAIN}.key"
-              send_log "step" "4" "Lind 163 ACME_SH OK"
+      send_log "step" "4" "Lind 163 ACME_SH OK"
 
       if [ -f "$CERT_FULLCHAIN_PATH" ] && [ -f "$CERT_KEY_PATH" ]; then
           CERT_SUCCESS="true"
