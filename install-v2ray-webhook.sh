@@ -153,10 +153,16 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
       
       # Issue cert using standalone mode (acme.sh handles the web server)
       $ACME_SH --register-account -m mehranmarandi90@gmail.com --server https://acme-v02.api.letsencrypt.org/directory
-      $ACME_SH --issue -d "s1.oiix.ir" --standalone --httpport 80 --force --server https://acme-v02.api.letsencrypt.org/directory || {
-        send_log "step" "4" "HTTP-01 challenge failed, falling back to non-TLS"
-        CERT_SUCCESS="false"
-      }
+      $ACME_SH --issue -d "$DOMAIN" --standalone --httpport 80 --force --server https://acme-v02.api.letsencrypt.org/directory 
+      if [ -f "/root/.acme.sh/$DOMAIN/fullchain.cer" ] && [ -f "/root/.acme.sh/$DOMAIN/$DOMAIN.key" ]; then
+          CERT_SUCCESS="true"
+          CERT_FULLCHAIN_PATH="/root/.acme.sh/$DOMAIN/fullchain.cer"
+          CERT_KEY_PATH="/root/.acme.sh/$DOMAIN/$DOMAIN.key"
+          send_log "step" "4" "Certificate successfully issued"
+      else
+          CERT_SUCCESS="false"
+          send_log "step" "4" "HTTP-01 challenge failed, falling back to non-TLS"
+      fi
   
       # Install cert if successful
       if [ "$CERT_SUCCESS" = "true" ]; then
