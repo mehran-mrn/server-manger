@@ -211,6 +211,17 @@ else
   # add a basic iptables accept rule (non-persistent)
   iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables rule add failed"
 fi
+# add iptables rules
+iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables INPUT rule add failed"
+iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -C FORWARD -s 0.0.0.0/0 -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -s 0.0.0.0/0 -j ACCEPT
+# enable ip_forward
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
 # ---------- detect public IP ----------
 MYIP="$(curl -s https://ipv4.icanhazip.com | tr -d '\n' || true)"
@@ -239,6 +250,14 @@ fi
 
 # ---------- write client info file ----------
 CLIENT_FILE="/root/vpn-client-${RUN_ID}.json"
+ADDR="${DOMAIN:-$MYIP}"
+if [[ "$USED_MODE" == stealth* ]]; then
+  SCHEME="vless://${UUID}@${ADDR}:${PORT}?type=ws&encryption=none&security=tls&host=${DOMAIN}&path=/#${HOSTNAME}"
+else
+  SCHEME="vless://${UUID}@${ADDR}:${PORT}?type=tcp&encryption=none#${HOSTNAME}"
+fi
+send_log "step" "11" "`${SCHEME}`"
+
 python3 - <<PY > "${CLIENT_FILE}"
 import json
 obj = {
@@ -270,7 +289,8 @@ print(json.dumps({
   "port":"$PORT",
   "uuid":"$UUID",
   "domain":"$DOMAIN",
-  "mode":"$USED_MODE"
+  "mode":"$USED_MODE",
+  "vless_link":"$SCHEME"
 }))
 PY
 )"
