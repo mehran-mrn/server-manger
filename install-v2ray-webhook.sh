@@ -171,8 +171,17 @@ send_log "step" "5" "Writing v2ray config to $CONFIG_PATH"
 
 # Create log directory
 mkdir -p /var/log/v2ray
+chown nobody:nogroup /var/log/v2ray 2>/dev/null || true
 
-if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
+# Backup existing config if exists
+if [ -f "$CONFIG_PATH" ]; then
+  cp "$CONFIG_PATH" "${CONFIG_PATH}.backup.$(date +%s)" || true
+fi
+
+# Create config directory if not exists
+mkdir -p "$(dirname "$CONFIG_PATH")"
+
+if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ] && [ -f "$CERT_FULLCHAIN_PATH" ] && [ -f "$CERT_KEY_PATH" ]; then
   # stealth: vless over websocket + tls (server uses provided cert)
   cat > "$CONFIG_PATH" <<EOF
 {
@@ -234,20 +243,64 @@ EOF
   PATH=""
 fi
 
+# Validate config file was written
+if [ ! -f "$CONFIG_PATH" ]; then
+  send_log "error" "5" "Config file was not created at $CONFIG_PATH"
+  exit 1
+fi
+
 send_log "step" "6" "Config written (mode: $USED_MODE)"
 
 # ---------- enable & start service ----------
 send_log "step" "7" "Enabling and starting v2ray service"
-systemctl daemon-reload
-systemctl enable --now v2ray || { send_log "error" "7" "Failed to start v2ray"; }
 
-sleep 3
-# verify listening
-if ss -ltnp 2>/dev/null | grep -q ":${PORT}[[:space:]]"; then
-  send_log "step" "8" "v2ray is listening on port ${PORT}"
-else
-  send_log "error" "8" "Service not listening on port ${PORT}"
+# Check if v2ray binary exists
+if [ ! -f "/usr/local/bin/v2ray" ]; then
+  send_log "error" "7" "v2ray binary not found at /usr/local/bin/v2ray"
+  exit 1
 fi
+
+# Reload systemd and enable service
+systemctl daemon-reload || { send_log "error" "7" "Failed to reload systemd daemon"; exit 1; }
+systemctl enable v2ray || { send_log "error" "7" "Failed to enable v2ray service"; exit 1; }
+
+# Start service
+systemctl start v2ray || { 
+  send_log "error" "7" "Failed to start v2ray service"
+  # Show service status for debugging
+  systemctl status v2ray || true
+  journalctl -u v2ray --no-pager -n 20 || true
+  exit 1
+}
+
+sleep 5
+
+# Check service status
+if ! systemctl is-active --quiet v2ray; then
+  send_log "error" "7" "v2ray service is not running after start attempt"
+  systemctl status v2ray || true
+  journalctl -u v2ray --no-pager -n 20 || true
+  exit 1
+fi
+
+# verify listening
+RETRIES=0
+while [ $RETRIES -lt 10 ]; do
+  if ss -ltnp 2>/dev/null | grep -q ":${PORT}[[:space:]]" || netstat -ltn 2>/dev/null | grep -q ":${PORT}[[:space:]]"; then
+    send_log "step" "8" "v2ray is listening on port ${PORT}"
+    break
+  else
+    RETRIES=$((RETRIES + 1))
+    if [ $RETRIES -eq 10 ]; then
+      send_log "error" "8" "Service not listening on port ${PORT} after 10 attempts"
+      # Debug information
+      ss -ltnp 2>/dev/null || netstat -ltn 2>/dev/null || true
+      systemctl status v2ray || true
+      exit 1
+    fi
+    sleep 2
+  fi
+done
 
 # ---------- firewall: try ufw or iptables fallback ----------
 send_log "step" "9" "Configuring firewall (allow port ${PORT})"
@@ -260,8 +313,22 @@ else
 fi
 
 # ---------- detect public IP ----------
-MYIP="$(curl -s https://ipv4.icanhazip.com | tr -d '\n' || curl -s https://ifconfig.me | tr -d '\n' || true)"
-send_log "step" "10" "Public IP detected: ${MYIP}"
+send_log "step" "10" "Detecting public IP"
+MYIP=""
+IP_SERVICES=("https://ipv4.icanhazip.com" "https://ifconfig.me" "https://api.ipify.org" "https://checkip.amazonaws.com")
+
+for service in "${IP_SERVICES[@]}"; do
+  MYIP="$(curl -s --max-time 10 "$service" | tr -d '\n\r' || true)"
+  if [[ "$MYIP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    send_log "step" "10" "Public IP detected: ${MYIP}"
+    break
+  fi
+done
+
+if [ -z "$MYIP" ]; then
+  send_log "error" "10" "Failed to detect public IP"
+  exit 1
+fi
 
 # ---------- update Cloudflare DNS if requested ----------
 if [ -n "$DOMAIN" ] && [ -n "$CF_ZONE_ID" ] && [ -n "$CF_API_TOKEN" ]; then
@@ -304,84 +371,130 @@ else
 fi
 
 # Generate VMess connection string (alternative format)
-VMESS_CONFIG="$(python3 - <<PY
+VMESS_CONFIG=""
+if command -v python3 >/dev/null 2>&1; then
+  VMESS_CONFIG="$(python3 - 2>/dev/null <<PY || echo ""
 import json, base64
-config = {
-  "v": "2",
-  "ps": "V2Ray-${RUN_ID}",
-  "add": "${SERVER_ADDR}",
-  "port": "${PORT}",
-  "id": "${UUID}",
-  "aid": "0",
-  "net": "${NETWORK}",
-  "type": "none",
-  "host": "${SERVER_ADDR}" if "${DOMAIN}" else "",
-  "path": "${PATH}",
-  "tls": "${SECURITY}"
-}
-vmess_json = json.dumps(config, separators=(',', ':'))
-vmess_b64 = base64.b64encode(vmess_json.encode()).decode()
-print("vmess://" + vmess_b64)
+try:
+    config = {
+        "v": "2",
+        "ps": "V2Ray-${RUN_ID}",
+        "add": "${SERVER_ADDR}",
+        "port": "${PORT}",
+        "id": "${UUID}",
+        "aid": "0",
+        "net": "${NETWORK}",
+        "type": "none",
+        "host": "${SERVER_ADDR}" if "${DOMAIN}" else "",
+        "path": "${PATH}",
+        "tls": "${SECURITY}"
+    }
+    vmess_json = json.dumps(config, separators=(',', ':'))
+    vmess_b64 = base64.b64encode(vmess_json.encode()).decode()
+    print("vmess://" + vmess_b64)
+except:
+    print("")
 PY
 )"
+fi
+
+send_log "step" "12" "Connection strings generated"
 
 # ---------- write client info file ----------
 CLIENT_FILE="/root/vpn-client-${RUN_ID}.json"
-python3 - <<PY > "${CLIENT_FILE}"
+send_log "step" "13" "Writing client info file"
+
+if command -v python3 >/dev/null 2>&1; then
+  python3 - 2>/dev/null <<PY > "${CLIENT_FILE}" || {
+    send_log "error" "13" "Failed to write client info file"
+    exit 1
+  }
 import json
-obj = {
-  "run_id":"${RUN_ID}",
-  "host":"${HOSTNAME}",
-  "ip":"${MYIP}",
-  "port":"${PORT}",
-  "uuid":"${UUID}",
-  "mode":"${USED_MODE}",
-  "domain":"${DOMAIN}",
-  "cert_fullchain":"${CERT_FULLCHAIN_PATH}",
-  "cert_key":"${CERT_KEY_PATH}",
-  "vless_string":"${VLESS_STRING}",
-  "vmess_string":"${VMESS_CONFIG}",
-  "server_address":"${SERVER_ADDR}",
-  "security":"${SECURITY}",
-  "network":"${NETWORK}",
-  "path":"${PATH}"
-}
-print(json.dumps(obj, indent=2))
+try:
+    obj = {
+        "run_id":"${RUN_ID}",
+        "host":"${HOSTNAME}",
+        "ip":"${MYIP}",
+        "port":"${PORT}",
+        "uuid":"${UUID}",
+        "mode":"${USED_MODE}",
+        "domain":"${DOMAIN}",
+        "cert_fullchain":"${CERT_FULLCHAIN_PATH}",
+        "cert_key":"${CERT_KEY_PATH}",
+        "vless_string":"${VLESS_STRING}",
+        "vmess_string":"${VMESS_CONFIG}",
+        "server_address":"${SERVER_ADDR}",
+        "security":"${SECURITY}",
+        "network":"${NETWORK}",
+        "path":"${PATH}"
+    }
+    print(json.dumps(obj, indent=2))
+except Exception as e:
+    print("{\"error\": \"Failed to generate JSON\"}")
 PY
+else
+  # Fallback without Python
+  cat > "${CLIENT_FILE}" <<EOF
+{
+  "run_id": "${RUN_ID}",
+  "host": "${HOSTNAME}",
+  "ip": "${MYIP}",
+  "port": "${PORT}",
+  "uuid": "${UUID}",
+  "mode": "${USED_MODE}",
+  "vless_string": "${VLESS_STRING}"
+}
+EOF
+fi
+
 chmod 600 "${CLIENT_FILE}"
-send_log "step" "12" "Wrote client info to ${CLIENT_FILE}"
+send_log "step" "13" "Client info written to ${CLIENT_FILE}"
 
 # ---------- test v2ray service ----------
-send_log "step" "13" "Testing v2ray service status"
+send_log "step" "14" "Testing v2ray service status"
 if systemctl is-active --quiet v2ray; then
-  send_log "step" "13" "v2ray service is active and running"
+  send_log "step" "14" "v2ray service is active and running"
 else
-  send_log "error" "13" "v2ray service is not running properly"
+  send_log "error" "14" "v2ray service is not running properly"
   systemctl status v2ray || true
 fi
 
 # ---------- final webhook with connection strings ----------
-FINAL_PAYLOAD="$(python3 - <<PY
+send_log "step" "15" "Preparing final webhook payload"
+
+if command -v python3 >/dev/null 2>&1; then
+  FINAL_PAYLOAD="$(python3 - 2>/dev/null <<PY || echo ""
+if command -v python3 >/dev/null 2>&1; then
+  FINAL_PAYLOAD="$(python3 - 2>/dev/null <<PY || echo ""
 import json
-print(json.dumps({
-  "run_id":"$RUN_ID",
-  "host":"$HOSTNAME",
-  "status":"finished",
-  "message":"Installation finished successfully",
-  "timestamp":"$(date -u +%FT%TZ)",
-  "ip":"$MYIP",
-  "port":"$PORT",
-  "uuid":"$UUID",
-  "domain":"$DOMAIN",
-  "mode":"$USED_MODE",
-  "vless_connection":"$VLESS_STRING",
-  "vmess_connection":"$VMESS_CONFIG",
-  "server_address":"$SERVER_ADDR",
-  "security":"$SECURITY",
-  "network":"$NETWORK"
-}))
+try:
+    print(json.dumps({
+        "run_id":"$RUN_ID",
+        "host":"$HOSTNAME", 
+        "status":"finished",
+        "message":"Installation finished successfully",
+        "timestamp":"$(date -u +%FT%TZ)",
+        "ip":"$MYIP",
+        "port":"$PORT",
+        "uuid":"$UUID",
+        "domain":"$DOMAIN",
+        "mode":"$USED_MODE",
+        "vless_connection":"$VLESS_STRING",
+        "vmess_connection":"$VMESS_CONFIG",
+        "server_address":"$SERVER_ADDR",
+        "security":"$SECURITY",
+        "network":"$NETWORK"
+    }))
+except:
+    print("{\"status\":\"error\",\"message\":\"Failed to generate payload\"}")
 PY
 )"
+else
+  # Fallback payload without Python
+  FINAL_PAYLOAD="{\"run_id\":\"$RUN_ID\",\"status\":\"finished\",\"message\":\"Installation completed\",\"ip\":\"$MYIP\",\"port\":\"$PORT\",\"uuid\":\"$UUID\",\"vless_connection\":\"$VLESS_STRING\"}"
+fi
+
+send_log "step" "15" "Sending final webhook notification"
 
 if [ -n "$WEBHOOK_USER" ] && [ -n "$WEBHOOK_PASS" ]; then
   curl -sS -u "$WEBHOOK_USER:$WEBHOOK_PASS" -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$FINAL_PAYLOAD" || echo "WARN: final webhook POST failed"
