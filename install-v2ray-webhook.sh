@@ -154,9 +154,9 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
       # Issue cert using standalone mode (acme.sh handles the web server)
       $ACME_SH --register-account -m mehranmarandi90@gmail.com --server https://acme-v02.api.letsencrypt.org/directory
       $ACME_SH --issue -d "$DOMAIN" --standalone --httpport 80 --force --server https://acme-v02.api.letsencrypt.org/directory 
-      CERT_FULLCHAIN_PATH="$($ACME_SH --info -d "$DOMAIN" | grep 'Full chain' | awk '{print $NF}')"
-      CERT_KEY_PATH="$($ACME_SH --info -d "$DOMAIN" | grep 'Key' | awk '{print $NF}')"
-      
+      CERT_FULLCHAIN_PATH="/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
+      CERT_KEY_PATH="/root/.acme.sh/${DOMAIN}_ecc/${DOMAIN}.key"
+
       if [ -f "$CERT_FULLCHAIN_PATH" ] && [ -f "$CERT_KEY_PATH" ]; then
           CERT_SUCCESS="true"
           send_log "step" "4" "Certificate successfully issued"
