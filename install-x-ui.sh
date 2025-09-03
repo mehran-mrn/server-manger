@@ -23,7 +23,7 @@ PORT="16823"
 PANEL_PORT="54321"
 RUN_ID=""
 MODE="auto"
-DEPS="cron wget iptables ufw unzip ca-certificates python3 jq openssl socat curl certbot python3-certbot-dns-cloudflare"
+DEPS="cron wget iptables ufw unzip ca-certificates python3 jq openssl socat curl certbot python3-certbot-dns-cloudflare sqlite3"
 ACME_SH="/root/.acme.sh/acme.sh"
 
 # -------- parse args ----------
@@ -117,6 +117,28 @@ bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release
 send_log "step" "4" "Installing 3X-UI with panel port ${PANEL_PORT}, username ${USERNAME}, password ${PASSWORD}"
 { echo "$PANEL_PORT"; echo "$USERNAME"; echo "$PASSWORD"; } | bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh) || { send_log "error" "4" "3X-UI install failed"; exit 1; }
 
+# ---------- configure 3X-UI panel settings ----------
+send_log "step" "4.5" "Configuring 3X-UI panel settings in database"
+DB_PATH="/etc/x-ui/x-ui.db"
+if [ -f "$DB_PATH" ]; then
+  # Wait for database to be ready
+  sleep 2
+  
+  # Update panel settings in database
+  sqlite3 "$DB_PATH" "UPDATE settings SET value='$PANEL_PORT' WHERE key='webPort';" || send_log "step" "4.5" "Failed to update webPort in database"
+  sqlite3 "$DB_PATH" "UPDATE settings SET value='$USERNAME' WHERE key='webUsername';" || send_log "step" "4.5" "Failed to update username in database"
+  sqlite3 "$DB_PATH" "UPDATE settings SET value='$PASSWORD' WHERE key='webPassword';" || send_log "step" "4.5" "Failed to update password in database"
+  
+  # Set other useful defaults
+  sqlite3 "$DB_PATH" "UPDATE settings SET value='/' WHERE key='webBasePath';" 2>/dev/null || true
+  sqlite3 "$DB_PATH" "UPDATE settings SET value='false' WHERE key='webCertFile';" 2>/dev/null || true
+  sqlite3 "$DB_PATH" "UPDATE settings SET value='false' WHERE key='webKeyFile';" 2>/dev/null || true
+  
+  send_log "step" "4.5" "Updated 3X-UI database settings"
+else
+  send_log "step" "4.5" "Database not found at $DB_PATH, will configure via config file"
+fi
+
 # ---------- firewall: allow panel port and inbound port ----------
 send_log "step" "5" "Configuring firewall (allow ports ${PANEL_PORT} and ${PORT})"
 if command -v ufw >/dev/null 2>&1; then
@@ -206,15 +228,40 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
   fi
 fi
 
+# ---------- update certificate settings in database if cert was issued ----------
+if [ "$CERT_ISSUED" -eq 1 ] && [ -f "$DB_PATH" ]; then
+  send_log "step" "6.5" "Updating certificate settings in database"
+  sqlite3 "$DB_PATH" "UPDATE settings SET value='$CERT_FULLCHAIN_PATH' WHERE key='webCertFile';" || send_log "step" "6.5" "Failed to update cert file path"
+  sqlite3 "$DB_PATH" "UPDATE settings SET value='$CERT_KEY_PATH' WHERE key='webKeyFile';" || send_log "step" "6.5" "Failed to update key file path"
+fi
+
 # ---------- restart 3X-UI service ----------
 send_log "step" "7" "Restarting 3X-UI service"
 systemctl restart x-ui || { send_log "error" "7" "Failed to restart 3X-UI"; }
 
-sleep 2
+# Wait longer for service to start
+sleep 5
+
+# Check if service is running
+if ! systemctl is-active --quiet x-ui; then
+  send_log "step" "7.5" "3X-UI service is not running, checking logs"
+  journalctl -u x-ui --no-pager -n 10 || true
+  send_log "step" "7.5" "Attempting to start service again"
+  systemctl start x-ui || { send_log "error" "7.5" "Failed to start 3X-UI service"; }
+  sleep 3
+fi
+
 if ss -ltnp 2>/dev/null | grep -q ":${PANEL_PORT}[[:space:]]"; then
   send_log "step" "8" "3X-UI is listening on port ${PANEL_PORT}"
 else
-  send_log "error" "8" "Service not listening on port ${PANEL_PORT}"
+  send_log "step" "8" "Service not listening on port ${PANEL_PORT}, checking netstat"
+  netstat -tlnp | grep x-ui || netstat -tlnp | grep "${PANEL_PORT}" || send_log "step" "8" "No process found listening on specified port"
+  
+  # Try to check what port it's actually listening on
+  ACTUAL_PORT=$(netstat -tlnp | grep x-ui | awk '{print $4}' | cut -d: -f2 | head -1)
+  if [ -n "$ACTUAL_PORT" ]; then
+    send_log "step" "8" "3X-UI is actually listening on port ${ACTUAL_PORT}"
+  fi
 fi
 
 # ---------- detect public IP ----------
@@ -305,3 +352,11 @@ echo "Username: ${USERNAME}"
 echo "Password: ${PASSWORD}"
 echo "Inbound Port Suggestion: ${PORT}"
 echo "Client file: ${CLIENT_FILE}"
+
+# ---------- final port check ----------
+echo ""
+echo "=== PORT STATUS CHECK ==="
+echo "Checking what ports are listening:"
+ss -tlnp | grep -E ":(${PANEL_PORT}|${PORT})" || echo "Neither specified ports are listening"
+echo "All listening ports:"
+ss -tlnp | grep LISTEN
