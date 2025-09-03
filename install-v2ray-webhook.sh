@@ -117,19 +117,41 @@ else
   iptables -I INPUT -p tcp --dport 443 -j ACCEPT || send_log "step" "4" "iptables rule port 443 add failed"
 fi
 # add iptables rules
-PUB_IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1)}}}')
-echo "Public interface: $PUB_IFACE"
+PUB_IFACE=$(ip route | grep default | head -1 | awk '{print $5}')
 
+# پاک کردن قوانین تداخل‌آفرین قبلی
+iptables -t nat -F POSTROUTING 2>/dev/null || true
+iptables -F FORWARD 2>/dev/null || true
+
+# اجازه ترافیک محلی
+iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+
+# اجازه اتصالات موجود
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+
+# اجازه پورت V2Ray
 iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "4" "iptables INPUT rule add failed"
-iptables -t nat -C POSTROUTING -o "$PUB_IFACE" -j MASQUERADE 2>/dev/null || \
-  iptables -t nat -A POSTROUTING -o "$PUB_IFACE" -j MASQUERADE
-iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-  iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-iptables -C FORWARD -s 0.0.0.0/0 -j ACCEPT 2>/dev/null || \
-  iptables -A FORWARD -s 0.0.0.0/0 -j ACCEPT
-# enable ip_forward
+
+# قوانین forwarding بهبود یافته
+iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT || send_log "step" "4" "iptables FORWARD ESTABLISHED rule failed"
+iptables -A FORWARD -i "$PUB_IFACE" -o "$PUB_IFACE" -j ACCEPT || send_log "step" "4" "iptables FORWARD interface rule failed"
+
+# NAT masquerading
+iptables -t nat -A POSTROUTING -o "$PUB_IFACE" -j MASQUERADE || send_log "step" "4" "iptables MASQUERADE rule failed"
+
+# فعال‌سازی IP forwarding
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
-grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-v2ray.conf
+
+# تنظیم DNS برای اطمینان
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+# ذخیره قوانین iptables (برای ماندگاری)
+if command -v iptables-save >/dev/null 2>&1; then
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+fi
 
 # ---------- obtain cert if domain+CF provided and mode requires stealth ----------
 CERT_KEY_PATH=""
@@ -285,6 +307,8 @@ else
 fi
 
 send_log "step" "12" "${VLESS_URI}"
+
+systemctl restart v2ray
 
 # ---------- write client info file ----------
 CLIENT_FILE="/root/vpn-client-${RUN_ID}.json"
