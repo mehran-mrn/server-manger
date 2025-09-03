@@ -187,7 +187,7 @@ fi
 CONFIG_PATH="/usr/local/etc/v2ray/config.json"
 send_log "step" "6" "Writing v2ray config to $CONFIG_PATH"
 
-if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
+if [ "$CERT_ISSUED" -eq 1 ] && [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
   # stealth: vless over websocket + tls (server uses provided cert)
   cat > "$CONFIG_PATH" <<EOF
 {
