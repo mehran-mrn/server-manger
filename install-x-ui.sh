@@ -45,7 +45,23 @@ while [[ $# -gt 0 ]]; do
     -h|--help) echo "Usage: $0 --webhook-url <url> [--webhook-user user --webhook-pass pass] [--domain ...]"; exit 0;;
     *) echo "Unknown arg: $1"; exit 2;;
   esac
-done
+# Try to configure via CLI command (most reliable method)
+if command -v x-ui >/dev/null 2>&1; then
+  send_log "step" "7.6" "Configuring credentials via x-ui CLI command"
+  
+  # Use x-ui command to set username and password
+  echo "4
+1
+$USERNAME
+$PASSWORD
+0" | x-ui >/dev/null 2>&1 || send_log "step" "7.6" "CLI configuration may have failed"
+  
+  send_log "step" "7.6" "Applied credentials via CLI"
+  
+  # Restart service after CLI changes
+  systemctl restart x-ui
+  sleep 3
+fi
 
 if [ -z "$WEBHOOK_URL" ]; then
   echo "ERROR: --webhook-url is required"; exit 1
