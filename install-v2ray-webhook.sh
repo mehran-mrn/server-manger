@@ -15,12 +15,13 @@ WEBHOOK_PASS=""
 WEBHOOK_SECRET=""    # optional header token legacy
 DOMAIN=""
 CF_ZONE_ID=""
+CF_ACCOUNT_ID=""
 CF_API_TOKEN=""
 CF_PROXIED="false"
 PORT="16823"
 RUN_ID=""
 MODE="auto"   # auto | simple | stealth
-DEPS="curl wget unzip ca-certificates python3 jq openssl socat"
+DEPS="cron wget iptables ufw unzip ca-certificates python3 jq openssl socat"
 ACME_SH="/root/.acme.sh/acme.sh"
 
 # -------- parse args ----------
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
     --webhook-secret) WEBHOOK_SECRET="$2"; shift 2;;
     --domain) DOMAIN="$2"; shift 2;;
     --cf-zone-id) CF_ZONE_ID="$2"; shift 2;;
+    --cf-account-id) CF_ACCOUNT_ID="$2"; shift 2;;
     --cf-api-token) CF_API_TOKEN="$2"; shift 2;;
     --cf-proxied) CF_PROXIED="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
@@ -101,44 +103,81 @@ bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/mast
 UUID="$(cat /proc/sys/kernel/random/uuid)"
 send_log "step" "3" "Generated UUID"
 
+# ---------- firewall: try ufw or iptables fallback ----------
+send_log "step" "4" "Configuring firewall (allow port ${PORT})"
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow "${PORT}/tcp" || send_log "step" "4" "ufw allow failed (maybe ufw inactive)"
+  ufw allow "80/tcp" || send_log "step" "4" "ufw allow failed port 80 (maybe ufw inactive)"
+  ufw allow "443/tcp" || send_log "step" "4" "ufw allow failed port 443 (maybe ufw inactive)"
+  ufw reload
+else
+  # add a basic iptables accept rule (non-persistent)
+  iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "4" "iptables rule add failed"
+  iptables -I INPUT -p tcp --dport 80 -j ACCEPT || send_log "step" "4" "iptables rule port 80 add failed"
+  iptables -I INPUT -p tcp --dport 443 -j ACCEPT || send_log "step" "4" "iptables rule port 443 add failed"
+fi
+# add iptables rules
+
+iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "4" "iptables INPUT rule add failed"
+iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -C FORWARD -s 0.0.0.0/0 -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -s 0.0.0.0/0 -j ACCEPT
+# enable ip_forward
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
 # ---------- obtain cert if domain+CF provided and mode requires stealth ----------
 CERT_KEY_PATH=""
 CERT_FULLCHAIN_PATH=""
 if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
   if [ -n "$DOMAIN" ] && [ -n "$CF_API_TOKEN" ]; then
-    send_log "step" "4" "Attempting to obtain TLS cert with acme.sh using Cloudflare DNS"
+    send_log "step" "5" "Attempting to obtain TLS cert with acme.sh using Cloudflare DNS"
     # install acme.sh if missing
     if [ ! -x "$ACME_SH" ]; then
       curl -sSfL https://get.acme.sh | sh || { send_log "error" "4" "acme.sh install failed"; }
     fi
     export CF_Token="$CF_API_TOKEN"
-    export CF_Zone="$CF_ZONE_ID"
+    export CF_Account_ID="$CF_ACCOUNT_ID"
+    export CF_Zone_ID="$CF_Account_ID"
     # issue cert (dns)
     /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --yes-I-know-dns-manual-mode || {
       # try with default installation path
-      /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" || send_log "step" "4" "acme.sh issue may have failed; continuing in non-TLS mode"
+      /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" || send_log "step" "5" "acme.sh issue may have failed; continuing in non-TLS mode"
     }
     # install cert to /etc/ssl/v2ray-<runid> if exists
     if /root/.acme.sh/acme.sh --list | grep -q "$DOMAIN"; then
       mkdir -p /etc/ssl/v2ray-$RUN_ID
       /root/.acme.sh/acme.sh --installcert -d "$DOMAIN" \
         --fullchain-file /etc/ssl/v2ray-$RUN_ID/fullchain.pem \
-        --key-file /etc/ssl/v2ray-$RUN_ID/key.pem || send_log "step" "4" "acme.sh installcert failed"
-      CERT_FULLCHAIN_PATH="/etc/ssl/v2ray-$RUN_ID/fullchain.pem"
-      CERT_KEY_PATH="/etc/ssl/v2ray-$RUN_ID/key.pem"
-      send_log "step" "4" "Certificate installed: $CERT_FULLCHAIN_PATH"
+        --key-file /etc/ssl/v2ray-$RUN_ID/key.pem || send_log "step" "5" "acme.sh installcert failed"
+        
+      # check if cert files actually exist
+      if [ -f "/etc/ssl/v2ray-$RUN_ID/fullchain.pem" ] && [ -f "/etc/ssl/v2ray-$RUN_ID/key.pem" ]; then
+        CERT_FULLCHAIN_PATH="/etc/ssl/v2ray-$RUN_ID/fullchain.pem"
+        CERT_KEY_PATH="/etc/ssl/v2ray-$RUN_ID/key.pem"
+        send_log "step" "5" "Certificate installed: $CERT_FULLCHAIN_PATH"
+      else
+        CERT_FULLCHAIN_PATH=""
+        CERT_KEY_PATH=""
+        send_log "step" "5" "Certificate issuance failed; no cert files found"
+      fi
+      
     else
-      send_log "step" "4" "Certificate not issued; will fall back to non-TLS config"
-      CERT_FULLCHAIN_PATH=""; CERT_KEY_PATH=""
+      send_log "step" "5" "Certificate not issued; will fall back to non-TLS config"
+      CERT_FULLCHAIN_PATH=""
+      CERT_KEY_PATH=""
     fi
   else
-    send_log "step" "4" "Skipping cert issuance (DOMAIN or CF_API_TOKEN missing)"
+    send_log "step" "5" "Skipping cert issuance (DOMAIN or CF_API_TOKEN missing)"
   fi
 fi
 
 # ---------- write v2ray config ----------
 CONFIG_PATH="/usr/local/etc/v2ray/config.json"
-send_log "step" "5" "Writing v2ray config to $CONFIG_PATH"
+send_log "step" "6" "Writing v2ray config to $CONFIG_PATH"
 
 if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
   # stealth: vless over websocket + tls (server uses provided cert)
@@ -188,28 +227,19 @@ EOF
   USED_MODE="simple (vless+tcp+none)"
 fi
 
-send_log "step" "6" "Config written (mode: $USED_MODE)"
+send_log "step" "7" "Config written (mode: $USED_MODE)"
 
 # ---------- enable & start service ----------
-send_log "step" "7" "Enabling and starting v2ray service"
+send_log "step" "8" "Enabling and starting v2ray service"
 systemctl daemon-reload
 systemctl enable --now v2ray || { send_log "error" "7" "Failed to start v2ray"; }
 
 sleep 2
 # verify listening
 if ss -ltnp 2>/dev/null | grep -q ":${PORT}[[:space:]]"; then
-  send_log "step" "8" "v2ray is listening on port ${PORT}"
+  send_log "step" "9" "v2ray is listening on port ${PORT}"
 else
-  send_log "error" "8" "Service not listening on port ${PORT}"
-fi
-
-# ---------- firewall: try ufw or iptables fallback ----------
-send_log "step" "9" "Configuring firewall (allow port ${PORT})"
-if command -v ufw >/dev/null 2>&1; then
-  ufw allow "${PORT}/tcp" || send_log "step" "9" "ufw allow failed (maybe ufw inactive)"
-else
-  # add a basic iptables accept rule (non-persistent)
-  iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables rule add failed"
+  send_log "error" "9" "Service not listening on port ${PORT}"
 fi
 
 # ---------- detect public IP ----------
