@@ -270,8 +270,7 @@ fi
 # ---------- build VLESS connection string ----------
 VLESS_URI="vless://${UUID}@${DOMAIN}:${PORT}?type=ws&encryption=none&security=tls&host=${DOMAIN}&path=/#VPN-${RUN_ID}"
 
-send_log "step" "12" "Connection URI: ${VLESS_URI}"
-echo "Connection: ${VLESS_URI}"
+send_log "step" "12" "${VLESS_URI}"
 
 # ---------- write client info file ----------
 CLIENT_FILE="/root/vpn-client-${RUN_ID}.json"
