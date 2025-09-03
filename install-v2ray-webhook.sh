@@ -117,10 +117,12 @@ else
   iptables -I INPUT -p tcp --dport 443 -j ACCEPT || send_log "step" "4" "iptables rule port 443 add failed"
 fi
 # add iptables rules
+PUB_IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1)}}}')
+echo "Public interface: $PUB_IFACE"
 
 iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "4" "iptables INPUT rule add failed"
-iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || \
-  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -t nat -C POSTROUTING -o "$PUB_IFACE" -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -o "$PUB_IFACE" -j MASQUERADE
 iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
   iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
 iptables -C FORWARD -s 0.0.0.0/0 -j ACCEPT 2>/dev/null || \
