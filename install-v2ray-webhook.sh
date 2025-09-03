@@ -141,7 +141,7 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
     fi
     export CF_Token="$CF_API_TOKEN"
     export CF_Account_ID="$CF_ACCOUNT_ID"
-    export CF_Zone_ID="$CF_Account_ID"
+    export CF_Zone_ID="$CF_ZONE_ID"
     # issue cert (dns)
     /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --yes-I-know-dns-manual-mode || {
       # try with default installation path
@@ -149,7 +149,9 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
     }
     # install cert to /etc/ssl/v2ray-<runid> if exists
     if /root/.acme.sh/acme.sh --list | grep -q "$DOMAIN"; then
+      rm -rf /etc/ssl/v2ray-$RUN_ID
       mkdir -p /etc/ssl/v2ray-$RUN_ID
+      
       /root/.acme.sh/acme.sh --installcert -d "$DOMAIN" \
         --fullchain-file /etc/ssl/v2ray-$RUN_ID/fullchain.pem \
         --key-file /etc/ssl/v2ray-$RUN_ID/key.pem || send_log "step" "5" "acme.sh installcert failed"
