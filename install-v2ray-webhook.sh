@@ -143,7 +143,7 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
     export CF_Account_ID="$CF_ACCOUNT_ID"
     export CF_Zone_ID="$CF_ZONE_ID"
     # issue cert (dns)
-    /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --yes-I-know-dns-manual-mode || {
+    /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --keylength ec-256 || {
       # try with default installation path
       /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" || send_log "step" "5" "acme.sh issue may have failed; continuing in non-TLS mode"
     }
