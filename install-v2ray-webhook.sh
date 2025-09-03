@@ -1,49 +1,27 @@
 #!/usr/bin/env bash
-# install-v2ray-webhook.sh (fixed version)
+# install-v2ray-webhook.sh (revised)
 # Usage example:
 # sudo ./install-v2ray-webhook.sh \
 #   --webhook-url "https://n8n.example/webhook/receive" \
 #   --webhook-user "botuser" --webhook-pass "botpass" \
 #   --domain "s1.oiix.ir" --cf-zone-id "ZONEID" --cf-api-token "CFTOKEN" \
 #   --cf-proxied "false" --port 16823
-
-# Prevent interactive prompts and fix terminal issues
-export DEBIAN_FRONTEND=noninteractive
-export APT_LISTCHANGES_FRONTEND=none
-export TERM=linux
-
-# Strict error handling
 set -euo pipefail
 
 # -------- defaults ----------
 WEBHOOK_URL=""
 WEBHOOK_USER=""
 WEBHOOK_PASS=""
-WEBHOOK_SECRET=""
+WEBHOOK_SECRET=""    # optional header token legacy
 DOMAIN=""
 CF_ZONE_ID=""
 CF_API_TOKEN=""
 CF_PROXIED="false"
 PORT="16823"
 RUN_ID=""
-MODE="auto"
-DEPS="curl wget unzip ca-certificates python3 jq openssl socat cron iptables"
+MODE="auto"   # auto | simple | stealth
+DEPS="curl wget unzip ca-certificates python3 jq openssl socat"
 ACME_SH="/root/.acme.sh/acme.sh"
-
-# Initialize certificate variables to avoid unbound variable errors
-CERT_KEY_PATH=""
-CERT_FULLCHAIN_PATH=""
-CERT_SUCCESS="false"
-UUID=""
-USED_MODE="simple"
-MYIP=""
-SCHEME=""
-CLIENT_FILE=""
-
-# Lock files for synchronization
-LOCK_FILE="/tmp/v2ray-install-$$.lock"
-WEBHOOK_LOCK="/tmp/v2ray-webhook-$$.lock"
-STEP_COUNTER=0
 
 # -------- parse args ----------
 while [[ $# -gt 0 ]]; do
@@ -58,39 +36,25 @@ while [[ $# -gt 0 ]]; do
     --cf-proxied) CF_PROXIED="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
     --run-id) RUN_ID="$2"; shift 2;;
-    --mode) MODE="$2"; shift 2;;
+    --mode) MODE="$2"; shift 2;; # auto/simple/stealth
     -h|--help) echo "Usage: $0 --webhook-url <url> [--webhook-user user --webhook-pass pass] [--domain ...]"; exit 0;;
     *) echo "Unknown arg: $1"; exit 2;;
   esac
 done
 
-# Validation
 if [ -z "$WEBHOOK_URL" ]; then
   echo "ERROR: --webhook-url is required"; exit 1
 fi
 if [ "$EUID" -ne 0 ]; then echo "ERROR: run as root"; exit 1; fi
-if [ -z "$RUN_ID" ]; then RUN_ID="$(date +%s)-$$"; fi
-
-# Fix hostname resolution issue
-HOSTNAME="$(hostname 2>/dev/null || echo "server-$$")"
-if ! grep -q "127.0.0.1.*$HOSTNAME" /etc/hosts; then
-    echo "127.0.0.1 $HOSTNAME" >> /etc/hosts
-fi
+if [ -z "$RUN_ID" ]; then RUN_ID="$(date +%s)-$RANDOM"; fi
+HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
 
 # -------- helper: send log to webhook ----------
 send_log(){
-    local STATUS="$1"; local STEP="$2"; local MESSAGE="$3"
-    local TS="$(date -u +%FT%TZ)"
-    
-    # Use lock to ensure logs are sent in order
-    (
-        flock -x 200
-        
-        STEP_COUNTER=$((STEP_COUNTER + 1))
-        
-        local PAYLOAD
-        PAYLOAD="$(python3 - <<PY
-import json
+  local STATUS="$1"; local STEP="$2"; local MESSAGE="$3"
+  local TS="$(date -u +%FT%TZ)"
+  PAYLOAD="$(python3 - <<PY
+import json,sys
 print(json.dumps({
   "run_id":"$RUN_ID",
   "host":"$HOSTNAME",
@@ -99,270 +63,100 @@ print(json.dumps({
   "message":"$MESSAGE",
   "timestamp":"$TS",
   "port":"$PORT",
-  "domain":"$DOMAIN",
-  "sequence":$STEP_COUNTER
+  "domain":"$DOMAIN"
 }))
 PY
 )"
-        
-        # Send webhook with retry mechanism
-        local webhook_success=false
-        for i in {1..3}; do
-            if [ -n "$WEBHOOK_USER" ] && [ -n "$WEBHOOK_PASS" ]; then
-                if curl -sS --connect-timeout 15 --max-time 45 -u "$WEBHOOK_USER:$WEBHOOK_PASS" -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$PAYLOAD" >/dev/null 2>&1; then
-                    webhook_success=true
-                    break
-                fi
-            elif [ -n "$WEBHOOK_SECRET" ]; then
-                if curl -sS --connect-timeout 15 --max-time 45 -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-Setup-Token: $WEBHOOK_SECRET" -d "$PAYLOAD" >/dev/null 2>&1; then
-                    webhook_success=true
-                    break
-                fi
-            else
-                if curl -sS --connect-timeout 15 --max-time 45 -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$PAYLOAD" >/dev/null 2>&1; then
-                    webhook_success=true
-                    break
-                fi
-            fi
-            
-            if [ $i -lt 3 ]; then
-                sleep 2
-            fi
-        done
-        
-        echo "[$TS] [$STATUS] step=$STEP: $MESSAGE"
-        
-        if [ "$webhook_success" = false ]; then
-            echo "WARN: webhook failed after 3 attempts"
-        fi
-        
-    ) 200>"$WEBHOOK_LOCK"
+  # choose curl auth
+  if [ -n "$WEBHOOK_USER" ] && [ -n "$WEBHOOK_PASS" ]; then
+    curl -sS -u "$WEBHOOK_USER:$WEBHOOK_PASS" -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$PAYLOAD" || echo "WARN: webhook POST failed"
+  elif [ -n "$WEBHOOK_SECRET" ]; then
+    curl -sS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-Setup-Token: $WEBHOOK_SECRET" -d "$PAYLOAD" || echo "WARN: webhook POST failed"
+  else
+    curl -sS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$PAYLOAD" || echo "WARN: webhook POST failed"
+  fi
+  echo "[$TS] [$STATUS] step=$STEP: $MESSAGE"
 }
 
-# Error trap with proper cleanup
+# error trap to report failure
 on_error(){
-    local rc=$?
-    local line_no=${1:-"unknown"}
-    send_log "error" "fatal" "Script failed at line $line_no with exit code $rc" || true
-    cleanup
-    exit $rc
+  local rc=$?
+  send_log "error" "fatal" "Script exited with code $rc"
+  exit $rc
 }
-trap 'on_error $LINENO' ERR
+trap on_error ERR
 
-# Cleanup function
-cleanup() {
-    rm -f "$LOCK_FILE" "$WEBHOOK_LOCK" 2>/dev/null || true
-}
-trap cleanup EXIT
+send_log "starting" "0" "Setup started (run_id=$RUN_ID)"
 
-# -------- execution wrapper ----------
-execute_step() {
-    local step_name="$1"
-    local step_func="$2"
-    
-    (
-        flock -x 201
-        echo "Starting: $step_name"
-        
-        if $step_func; then
-            echo "Completed: $step_name"
-            return 0
-        else
-            echo "Failed: $step_name"
-            return 1
-        fi
-        
-    ) 201>"$LOCK_FILE"
-}
+# ---------- install deps ----------
+send_log "step" "1" "Updating packages and installing prerequisites"
+apt-get update -y
+apt-get install -y $DEPS || { send_log "error" "1" "Failed to install packages"; exit 1; }
 
-# -------- step functions ----------
-step_init() {
-    send_log "starting" "init" "Setup started (run_id=$RUN_ID, hostname=$HOSTNAME)"
-    return 0
-}
+# ---------- install v2ray using fhs-install (official) ----------
+send_log "step" "2" "Installing v2ray (fhs-install-v2ray)"
+bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh) || { send_log "error" "2" "v2ray install failed"; exit 1; }
 
-step_system_prepare() {
-    send_log "step" "system" "Preparing system environment"
-    
-    # Update package cache
-    apt-get update -y >/dev/null 2>&1
-    
-    # Install dependencies with retry
-    for i in {1..3}; do
-        if apt-get install -y $DEPS >/dev/null 2>&1; then
-            send_log "step" "system" "System packages installed successfully"
-            return 0
-        fi
-        if [ $i -lt 3 ]; then
-            sleep 5
-            apt-get update -y >/dev/null 2>&1
-        fi
-    done
-    
-    send_log "error" "system" "Failed to install system packages after 3 attempts"
-    return 1
-}
+# ---------- create uuid ----------
+UUID="$(cat /proc/sys/kernel/random/uuid)"
+send_log "step" "3" "Generated UUID"
 
-step_install_v2ray() {
-    send_log "step" "v2ray" "Installing v2ray (fhs-install-v2ray)"
-    
-    for i in {1..3}; do
-        if bash <(curl -fsSL https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh) >/dev/null 2>&1; then
-            send_log "step" "v2ray" "v2ray installed successfully"
-            return 0
-        fi
-        if [ $i -lt 3 ]; then
-            sleep 5
-        fi
-    done
-    
-    send_log "error" "v2ray" "Failed to install v2ray after 3 attempts"
-    return 1
-}
-
-step_generate_uuid() {
-    UUID="$(cat /proc/sys/kernel/random/uuid)"
-    send_log "step" "uuid" "Generated UUID: ${UUID:0:8}...${UUID: -4}"
-    return 0
-}
-
-step_configure_firewall() {
-    send_log "step" "firewall" "Configuring firewall rules"
-    
-    # Configure UFW if available
-    if command -v ufw >/dev/null 2>&1; then
-        ufw --force reset >/dev/null 2>&1 || true
-        ufw allow 22/tcp >/dev/null 2>&1 || true
-        ufw allow 80/tcp >/dev/null 2>&1 || true
-        ufw allow 443/tcp >/dev/null 2>&1 || true
-        ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
-        echo "y" | ufw enable >/dev/null 2>&1 || true
+# ---------- obtain cert if domain+CF provided and mode requires stealth ----------
+CERT_KEY_PATH=""
+CERT_FULLCHAIN_PATH=""
+if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
+  if [ -n "$DOMAIN" ] && [ -n "$CF_API_TOKEN" ]; then
+    send_log "step" "4" "Attempting to obtain TLS cert with acme.sh using Cloudflare DNS"
+    # install acme.sh if missing
+    if [ ! -x "$ACME_SH" ]; then
+      curl -sSfL https://get.acme.sh | sh || { send_log "error" "4" "acme.sh install failed"; }
     fi
-    
-    # Configure iptables
-    iptables -I INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
-    
-    # Enable IP forwarding
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    fi
-    
-    send_log "step" "firewall" "Firewall configured (allowed ports: 22, 80, 443, $PORT)"
-    return 0
-}
-
-step_handle_certificate() {
-    CERT_SUCCESS="false"
-    
-    if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
-        if [ -n "$DOMAIN" ]; then
-            send_log "step" "cert" "Checking certificate requirements for domain: $DOMAIN"
-            
-            # Check rate limit first by trying to get existing cert info
-            if [ -d "/root/.acme.sh/${DOMAIN}_ecc" ]; then
-                CERT_FULLCHAIN_PATH="/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
-                CERT_KEY_PATH="/root/.acme.sh/${DOMAIN}_ecc/${DOMAIN}.key"
-                
-                if [ -f "$CERT_FULLCHAIN_PATH" ] && [ -f "$CERT_KEY_PATH" ]; then
-                    # Check if cert is still valid (more than 7 days)
-                    if openssl x509 -in "$CERT_FULLCHAIN_PATH" -noout -checkend 604800 2>/dev/null; then
-                        CERT_SUCCESS="true"
-                        send_log "step" "cert" "Using existing valid certificate"
-                        return 0
-                    fi
-                fi
-            fi
-            
-            # Try to get new certificate if no valid one exists
-            send_log "step" "cert" "Attempting to obtain new TLS certificate"
-            
-            # Install acme.sh if not present
-            if [ ! -x "$ACME_SH" ]; then
-                if curl -sSfL https://get.acme.sh | sh >/dev/null 2>&1; then
-                    send_log "step" "cert" "acme.sh installed"
-                else
-                    send_log "step" "cert" "Failed to install acme.sh, skipping TLS"
-                    return 0
-                fi
-            fi
-            
-            # Only try if acme.sh is available
-            if [ -x "$ACME_SH" ]; then
-                # Stop services that might use port 80
-                systemctl stop apache2 2>/dev/null || true
-                systemctl stop nginx 2>/dev/null || true
-                systemctl stop lighttpd 2>/dev/null || true
-                pkill -f ":80" 2>/dev/null || true
-                
-                sleep 5
-                
-                # Try to issue certificate (suppress rate limit errors)
-                if $ACME_SH --issue -d "$DOMAIN" --standalone --httpport 80 --server https://acme-v02.api.letsencrypt.org/directory >/dev/null 2>&1; then
-                    CERT_FULLCHAIN_PATH="/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
-                    CERT_KEY_PATH="/root/.acme.sh/${DOMAIN}_ecc/${DOMAIN}.key"
-                    
-                    if [ -f "$CERT_FULLCHAIN_PATH" ] && [ -f "$CERT_KEY_PATH" ]; then
-                        CERT_SUCCESS="true"
-                        send_log "step" "cert" "New certificate obtained successfully"
-                    fi
-                else
-                    send_log "step" "cert" "Certificate issuance failed (likely rate limited), continuing without TLS"
-                fi
-            fi
-        else
-            send_log "step" "cert" "No domain provided, skipping certificate"
-        fi
+    export CF_Token="$CF_API_TOKEN"
+    export CF_Zone="$CF_ZONE_ID"
+    # issue cert (dns)
+    /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --yes-I-know-dns-manual-mode || {
+      # try with default installation path
+      /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" || send_log "step" "4" "acme.sh issue may have failed; continuing in non-TLS mode"
+    }
+    # install cert to /etc/ssl/v2ray-<runid> if exists
+    if /root/.acme.sh/acme.sh --list | grep -q "$DOMAIN"; then
+      mkdir -p /etc/ssl/v2ray-$RUN_ID
+      /root/.acme.sh/acme.sh --installcert -d "$DOMAIN" \
+        --fullchain-file /etc/ssl/v2ray-$RUN_ID/fullchain.pem \
+        --key-file /etc/ssl/v2ray-$RUN_ID/key.pem || send_log "step" "4" "acme.sh installcert failed"
+      CERT_FULLCHAIN_PATH="/etc/ssl/v2ray-$RUN_ID/fullchain.pem"
+      CERT_KEY_PATH="/etc/ssl/v2ray-$RUN_ID/key.pem"
+      send_log "step" "4" "Certificate installed: $CERT_FULLCHAIN_PATH"
     else
-        send_log "step" "cert" "Mode is simple, skipping certificate"
+      send_log "step" "4" "Certificate not issued; will fall back to non-TLS config"
+      CERT_FULLCHAIN_PATH=""; CERT_KEY_PATH=""
     fi
-    
-    if [ "$CERT_SUCCESS" = "false" ]; then
-        CERT_FULLCHAIN_PATH=""
-        CERT_KEY_PATH=""
-        send_log "step" "cert" "Will use non-TLS configuration"
-    fi
-    
-    return 0
-}
+  else
+    send_log "step" "4" "Skipping cert issuance (DOMAIN or CF_API_TOKEN missing)"
+  fi
+fi
 
-step_write_config() {
-    local CONFIG_PATH="/usr/local/etc/v2ray/config.json"
-    send_log "step" "config" "Writing v2ray configuration"
-    
-    # Create directories
-    mkdir -p /var/log/v2ray
-    mkdir -p "$(dirname "$CONFIG_PATH")"
-    
-    # Determine configuration type
-    if [ "$CERT_SUCCESS" = "true" ] && [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
-        USED_MODE="stealth (vless+ws+tls)"
-        
-        cat > "$CONFIG_PATH" <<EOF
+# ---------- write v2ray config ----------
+CONFIG_PATH="/usr/local/etc/v2ray/config.json"
+send_log "step" "5" "Writing v2ray config to $CONFIG_PATH"
+
+if [ -n "$CERT_FULLCHAIN_PATH" ] && [ -n "$CERT_KEY_PATH" ]; then
+  # stealth: vless over websocket + tls (server uses provided cert)
+  cat > "$CONFIG_PATH" <<EOF
 {
-  "log": {
-    "access": "/var/log/v2ray/access.log",
-    "error": "/var/log/v2ray/error.log",
-    "loglevel": "warning"
-  },
+  "log": {"access": "/var/log/v2ray/access.log","error": "/var/log/v2ray/error.log","loglevel": "warning"},
   "inbounds": [{
     "port": ${PORT},
     "protocol": "vless",
     "settings": {
-      "clients": [{"id":"${UUID}","level":0,"email":"client@example.com"}],
+      "clients": [{"id":"${UUID}","level":0,"email":"mehranmarandi90@gmail.com"}],
       "decryption":"none"
     },
     "streamSettings": {
       "network": "ws",
       "security": "tls",
       "tlsSettings": {
-        "certificates": [{
-          "certificateFile": "${CERT_FULLCHAIN_PATH}",
-          "keyFile": "${CERT_KEY_PATH}"
-        }]
+        "certificates": [{"certificateFile":"${CERT_FULLCHAIN_PATH}","keyFile":"${CERT_KEY_PATH}"}]
       },
       "wsSettings": { "path": "/" }
     }
@@ -370,22 +164,17 @@ step_write_config() {
   "outbounds": [{"protocol":"freedom"}]
 }
 EOF
-        send_log "step" "config" "Configuration written with TLS support"
-    else
-        USED_MODE="simple (vless+tcp+none)"
-        
-        cat > "$CONFIG_PATH" <<EOF
+  USED_MODE="stealth (vless+ws+tls)"
+else
+  # simple: vless tcp no-tls (fallback)
+  cat > "$CONFIG_PATH" <<EOF
 {
-  "log": {
-    "access": "/var/log/v2ray/access.log",
-    "error": "/var/log/v2ray/error.log",
-    "loglevel": "warning"
-  },
+  "log": {"access": "/var/log/v2ray/access.log","error": "/var/log/v2ray/error.log","loglevel": "warning"},
   "inbounds": [{
     "port": ${PORT},
     "protocol": "vless",
     "settings": {
-      "clients": [{"id":"${UUID}","level":0,"email":"client@example.com"}],
+      "clients": [{"id":"${UUID}","level":0,"email":"mehranmarandi90@gmail.com"}],
       "decryption":"none"
     },
     "streamSettings": {
@@ -396,180 +185,105 @@ EOF
   "outbounds": [{"protocol":"freedom"}]
 }
 EOF
-        send_log "step" "config" "Configuration written without TLS (fallback mode)"
-    fi
-    
-    return 0
-}
+  USED_MODE="simple (vless+tcp+none)"
+fi
 
-step_start_service() {
-    send_log "step" "service" "Starting v2ray service"
-    
-    systemctl daemon-reload >/dev/null 2>&1
-    systemctl enable v2ray >/dev/null 2>&1
-    
-    for i in {1..3}; do
-        if systemctl start v2ray >/dev/null 2>&1 && sleep 3 && systemctl is-active --quiet v2ray; then
-            send_log "step" "service" "v2ray service started successfully"
-            
-            # Verify port is listening
-            local attempts=0
-            while [ $attempts -lt 10 ]; do
-                if ss -ltnp 2>/dev/null | grep -q ":${PORT}[[:space:]]"; then
-                    send_log "step" "service" "v2ray is listening on port $PORT"
-                    return 0
-                fi
-                attempts=$((attempts + 1))
-                sleep 2
-            done
-            
-            send_log "error" "service" "Service started but not listening on port $PORT"
-            return 1
-        fi
-        
-        if [ $i -lt 3 ]; then
-            systemctl stop v2ray >/dev/null 2>&1 || true
-            sleep 5
-        fi
-    done
-    
-    send_log "error" "service" "Failed to start v2ray service after 3 attempts"
-    return 1
-}
+send_log "step" "6" "Config written (mode: $USED_MODE)"
 
-step_network_setup() {
-    send_log "step" "network" "Setting up network configuration"
-    
-    # Get public IP
-    for i in {1..3}; do
-        MYIP="$(curl -s --connect-timeout 10 --max-time 20 https://ipv4.icanhazip.com 2>/dev/null | tr -d '\n' || 
-                curl -s --connect-timeout 10 --max-time 20 https://api.ipify.org 2>/dev/null || 
-                curl -s --connect-timeout 10 --max-time 20 https://checkip.amazonaws.com 2>/dev/null | tr -d '\n' || true)"
-        
-        if [ -n "$MYIP" ]; then
-            send_log "step" "network" "Public IP detected: $MYIP"
-            break
-        fi
-        
-        if [ $i -lt 3 ]; then
-            sleep 5
-        fi
-    done
-    
-    if [ -z "$MYIP" ]; then
-        send_log "error" "network" "Failed to detect public IP address"
-        return 1
-    fi
-    
-    return 0
-}
+# ---------- enable & start service ----------
+send_log "step" "7" "Enabling and starting v2ray service"
+systemctl daemon-reload
+systemctl enable --now v2ray || { send_log "error" "7" "Failed to start v2ray"; }
 
-step_cloudflare_dns() {
-    if [ -n "$DOMAIN" ] && [ -n "$CF_ZONE_ID" ] && [ -n "$CF_API_TOKEN" ]; then
-        send_log "step" "dns" "Updating Cloudflare DNS record for $DOMAIN"
-        
-        # Get existing record
-        local GET_REC
-        GET_REC="$(curl -s --connect-timeout 15 --max-time 30 \
-            -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${DOMAIN}" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: application/json" 2>/dev/null)" || true
-        
-        local RECORD_ID
-        RECORD_ID="$(echo "$GET_REC" | jq -r '.result[0].id // empty' 2>/dev/null || true)"
-        
-        if [ -n "$RECORD_ID" ] && [ "$RECORD_ID" != "null" ] && [ "$RECORD_ID" != "empty" ]; then
-            # Update existing record
-            if curl -s --connect-timeout 15 --max-time 30 \
-                -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
-                -H "Authorization: Bearer ${CF_API_TOKEN}" \
-                -H "Content-Type: application/json" \
-                --data "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${MYIP}\",\"ttl\":120,\"proxied\":${CF_PROXIED}}" \
-                >/dev/null 2>&1; then
-                send_log "step" "dns" "Updated existing DNS record: $DOMAIN -> $MYIP"
-            else
-                send_log "step" "dns" "Failed to update DNS record"
-            fi
-        else
-            # Create new record
-            if curl -s --connect-timeout 15 --max-time 30 \
-                -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
-                -H "Authorization: Bearer ${CF_API_TOKEN}" \
-                -H "Content-Type: application/json" \
-                --data "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${MYIP}\",\"ttl\":120,\"proxied\":${CF_PROXIED}}" \
-                >/dev/null 2>&1; then
-                send_log "step" "dns" "Created new DNS record: $DOMAIN -> $MYIP"
-            else
-                send_log "step" "dns" "Failed to create DNS record"
-            fi
-        fi
-    else
-        send_log "step" "dns" "Skipping Cloudflare DNS (parameters missing)"
-    fi
-    
-    return 0
-}
+sleep 2
+# verify listening
+if ss -ltnp 2>/dev/null | grep -q ":${PORT}[[:space:]]"; then
+  send_log "step" "8" "v2ray is listening on port ${PORT}"
+else
+  send_log "error" "8" "Service not listening on port ${PORT}"
+fi
 
-step_finalize() {
-    send_log "step" "finalize" "Finalizing installation"
-    
-    # Generate connection details
-    local ADDR="${DOMAIN:-$MYIP}"
-    if [[ "$USED_MODE" == *"tls"* ]]; then
-        SCHEME="vless://${UUID}@${ADDR}:${PORT}?type=ws&encryption=none&security=tls&host=${DOMAIN}&path=/#${HOSTNAME}"
-    else
-        SCHEME="vless://${UUID}@${ADDR}:${PORT}?type=tcp&encryption=none#${HOSTNAME}"
-    fi
-    
-    # Create client info file
-    CLIENT_FILE="/root/vpn-client-${RUN_ID}.json"
-    python3 - <<PY > "${CLIENT_FILE}"
+# ---------- firewall: try ufw or iptables fallback ----------
+send_log "step" "9" "Configuring firewall (allow port ${PORT})"
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow "${PORT}/tcp" || send_log "step" "9" "ufw allow failed (maybe ufw inactive)"
+else
+  # add a basic iptables accept rule (non-persistent)
+  iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || send_log "step" "9" "iptables rule add failed"
+fi
+
+# ---------- detect public IP ----------
+MYIP="$(curl -s https://ipv4.icanhazip.com | tr -d '\n' || true)"
+send_log "step" "10" "Public IP detected: ${MYIP}"
+
+# ---------- update Cloudflare DNS if requested ----------
+if [ -n "$DOMAIN" ] && [ -n "$CF_ZONE_ID" ] && [ -n "$CF_API_TOKEN" ]; then
+  send_log "step" "11" "Updating Cloudflare DNS for ${DOMAIN} (proxied=${CF_PROXIED})"
+  GET_REC="$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${DOMAIN}" \
+    -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json")"
+  RECORD_ID="$(echo "$GET_REC" | jq -r '.result[0].id // empty')"
+  if [ -n "$RECORD_ID" ]; then
+    curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+      --data "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${MYIP}\",\"ttl\":120,\"proxied\":${CF_PROXIED}}" >/dev/null || send_log "error" "11" "Cloudflare update PUT failed"
+    send_log "step" "11" "Updated existing record id=${RECORD_ID}"
+  else
+    curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+      --data "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${MYIP}\",\"ttl\":120,\"proxied\":${CF_PROXIED}}" >/dev/null || send_log "error" "11" "Cloudflare create POST failed"
+    send_log "step" "11" "Created A record ${DOMAIN} -> ${MYIP}"
+  fi
+else
+  send_log "step" "11" "Skipping Cloudflare update (domain/zone/token missing)"
+fi
+
+# ---------- write client info file ----------
+CLIENT_FILE="/root/vpn-client-${RUN_ID}.json"
+python3 - <<PY > "${CLIENT_FILE}"
 import json
 obj = {
-  "run_id": "$RUN_ID",
-  "host": "$HOSTNAME",
-  "ip": "$MYIP",
-  "port": "$PORT",
-  "uuid": "$UUID",
-  "mode": "$USED_MODE",
-  "domain": "$DOMAIN",
-  "vless_link": "$SCHEME",
-  "timestamp": "$(date -u +%FT%TZ)"
+  "run_id":"${RUN_ID}",
+  "host":"${HOSTNAME}",
+  "ip":"${MYIP}",
+  "port":"${PORT}",
+  "uuid":"${UUID}",
+  "mode":"${USED_MODE}",
+  "domain":"${DOMAIN}",
+  "cert_fullchain":"${CERT_FULLCHAIN_PATH}",
+  "cert_key":"${CERT_KEY_PATH}"
 }
 print(json.dumps(obj, indent=2))
 PY
-    
-    chmod 600 "$CLIENT_FILE"
-    send_log "step" "finalize" "Client configuration saved to $CLIENT_FILE"
-    
-    # Send final status
-    send_log "finished" "complete" "Installation completed successfully - $SCHEME"
-    
-    return 0
-}
+chmod 600 "${CLIENT_FILE}"
+send_log "step" "12" "Wrote client info to ${CLIENT_FILE}"
 
-# -------- main execution ----------
-echo "Starting V2Ray installation with improved error handling..."
+# ---------- final webhook ----------
+FINAL_PAYLOAD="$(python3 - <<PY
+import json
+print(json.dumps({
+  "run_id":"$RUN_ID",
+  "host":"$HOSTNAME",
+  "status":"finished",
+  "message":"Installation finished",
+  "timestamp":"$(date -u +%FT%TZ)",
+  "ip":"$MYIP",
+  "port":"$PORT",
+  "uuid":"$UUID",
+  "domain":"$DOMAIN",
+  "mode":"$USED_MODE"
+}))
+PY
+)"
+if [ -n "$WEBHOOK_USER" ] && [ -n "$WEBHOOK_PASS" ]; then
+  curl -sS -u "$WEBHOOK_USER:$WEBHOOK_PASS" -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$FINAL_PAYLOAD" || echo "WARN: final webhook POST failed"
+elif [ -n "$WEBHOOK_SECRET" ]; then
+  curl -sS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-Setup-Token: $WEBHOOK_SECRET" -d "$FINAL_PAYLOAD" || echo "WARN: final webhook POST failed"
+else
+  curl -sS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$FINAL_PAYLOAD" || echo "WARN: final webhook POST failed"
+fi
 
-# Execute all steps
-execute_step "Initialize" step_init
-execute_step "Prepare System" step_system_prepare  
-execute_step "Install V2Ray" step_install_v2ray
-execute_step "Generate UUID" step_generate_uuid
-execute_step "Configure Firewall" step_configure_firewall
-execute_step "Handle Certificate" step_handle_certificate
-execute_step "Write Configuration" step_write_config
-execute_step "Start Service" step_start_service
-execute_step "Setup Network" step_network_setup
-execute_step "Update DNS" step_cloudflare_dns
-execute_step "Finalize" step_finalize
-
-echo ""
-echo "=== INSTALLATION COMPLETED ==="
+echo "=== DONE ==="
 echo "UUID: ${UUID}"
 echo "PORT: ${PORT}"
-echo "MODE: ${USED_MODE}"
 echo "IP: ${MYIP}"
-echo "CONNECTION: ${SCHEME}"
-echo "CONFIG FILE: ${CLIENT_FILE}"
-echo ""
+echo "Client file: ${CLIENT_FILE}"
