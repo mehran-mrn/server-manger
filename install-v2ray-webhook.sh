@@ -132,6 +132,8 @@ grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1"
 # ---------- obtain cert if domain+CF provided and mode requires stealth ----------
 CERT_KEY_PATH=""
 CERT_FULLCHAIN_PATH=""
+CERT_ISSUED=0
+
 if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
   if [ -n "$DOMAIN" ] && [ -n "$CF_API_TOKEN" ]; then
     send_log "step" "5" "Attempting to obtain TLS cert with acme.sh using Cloudflare DNS"
@@ -143,13 +145,14 @@ if [ "$MODE" = "auto" ] || [ "$MODE" = "stealth" ]; then
     export CF_Account_ID="$CF_ACCOUNT_ID"
     export CF_Zone_ID="$CF_ZONE_ID"
     # issue cert (dns)
+    /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
     /root/.acme.sh/acme.sh --register-account -m mehranmarandi90@gmail.com
-    /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --keylength ec-256 || {
+    /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --keylength ec-256 && CERT_ISSUED=1 || {
       # try with default installation path
       /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" || send_log "step" "5" "acme.sh issue may have failed; continuing in non-TLS mode"
     }
     # install cert to /etc/ssl/v2ray-<runid> if exists
-    if /root/.acme.sh/acme.sh --list | grep -q "$DOMAIN"; then
+    if [ "$CERT_ISSUED" -eq 1 ] && /root/.acme.sh/acme.sh --list | grep -q "$DOMAIN"; then
       rm -rf /etc/ssl/v2ray-$RUN_ID
       mkdir -p /etc/ssl/v2ray-$RUN_ID
       
