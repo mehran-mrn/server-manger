@@ -276,7 +276,13 @@ else
 fi
 
 # ---------- build VLESS connection string ----------
-VLESS_URI="vless://${UUID}@${DOMAIN}:${PORT}?type=ws&encryption=none&security=tls&host=${DOMAIN}&path=/#VPN-${RUN_ID}"
+if [ "$CERT_ISSUED" -eq 1 ] && [ -f "$CERT_FULLCHAIN_PATH" ] && [ -f "$CERT_KEY_PATH" ]; then
+    # stealth: ws + tls
+    VLESS_URI="vless://${UUID}@${DOMAIN}:${PORT}?type=ws&encryption=none&security=tls&host=${DOMAIN}&path=/#VPN-${RUN_ID}"
+else
+    # fallback: tcp + none
+    VLESS_URI="vless://${UUID}@${DOMAIN}:${PORT}?type=tcp&encryption=none&security=none#VPN-${RUN_ID}"
+fi
 
 send_log "step" "12" "${VLESS_URI}"
 
