@@ -267,6 +267,12 @@ else
   send_log "step" "11" "Skipping Cloudflare update (domain/zone/token missing)"
 fi
 
+# ---------- build VLESS connection string ----------
+VLESS_URI="vless://${UUID}@${DOMAIN}:${PORT}?type=ws&encryption=none&security=tls&host=${DOMAIN}&path=/#VPN-${RUN_ID}"
+
+send_log "step" "12" "Connection URI: ${VLESS_URI}"
+echo "Connection: ${VLESS_URI}"
+
 # ---------- write client info file ----------
 CLIENT_FILE="/root/vpn-client-${RUN_ID}.json"
 python3 - <<PY > "${CLIENT_FILE}"
@@ -285,7 +291,7 @@ obj = {
 print(json.dumps(obj, indent=2))
 PY
 chmod 600 "${CLIENT_FILE}"
-send_log "step" "12" "Wrote client info to ${CLIENT_FILE}"
+send_log "step" "13" "Wrote client info to ${CLIENT_FILE}"
 
 # ---------- final webhook ----------
 FINAL_PAYLOAD="$(python3 - <<PY
