@@ -129,7 +129,20 @@ if [ -f "$DB_PATH" ]; then
   sqlite3 "$DB_PATH" "UPDATE settings SET value='$USERNAME' WHERE key='webUsername';" || send_log "step" "4.5" "Failed to update username in database"
     HASHED_PASS=$(htpasswd -bnBC 12 "" "$PASSWORD" | tr -d ':\n')   
   sqlite3 "$DB_PATH" "UPDATE settings SET value='$HASHED_PASS' WHERE key='webPassword';" || send_log "step" "4.5" "Failed to update password in database"
-
+  
+  # Generate bcrypt hashed password
+  HASHED_PASS=$(htpasswd -bnBC 12 "" "$PASSWORD" | tr -d ':\n')
+  
+  # Check if admin exists
+  ADMIN_EXISTS=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users WHERE username='admin';")
+  
+  if [ "$ADMIN_EXISTS" -eq 0 ]; then
+      # Create admin user if not exists
+      sqlite3 "$DB_PATH" "INSERT INTO users (username, password, role) VALUES ('admin', '$HASHED_PASS', 'admin');" || send_log "step" "4.5" "Failed to create admin user"
+  else
+      # Update admin password if exists
+      sqlite3 "$DB_PATH" "UPDATE users SET password='$HASHED_PASS' WHERE username='admin';" || send_log "step" "4.5" "Failed to update admin password"
+  fi
   # Set other useful defaults
   sqlite3 "$DB_PATH" "UPDATE settings SET value='/' WHERE key='webBasePath';" 2>/dev/null || true
   sqlite3 "$DB_PATH" "UPDATE settings SET value='false' WHERE key='webCertFile';" 2>/dev/null || true
