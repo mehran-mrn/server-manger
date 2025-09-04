@@ -128,12 +128,12 @@ if [ -f "$DB_PATH" ]; then
   sqlite3 "$DB_PATH" "UPDATE settings SET value='$PANEL_PORT' WHERE key='webPort';" || send_log "step" "4.5" "Failed to update webPort in database"
   sqlite3 "$DB_PATH" "UPDATE settings SET value='$USERNAME' WHERE key='webUsername';" || send_log "step" "4.5" "Failed to update username in database"
   
-  HASHED_PASS="$(python3 - <<PY
-    import bcrypt
-    pw = b"$PASSWORD"
-    print(bcrypt.hashpw(pw, bcrypt.gensalt()).decode())
-    PY
-    )"
+HASHED_PASS=$(python3 - <<PY
+import bcrypt
+pw = b"$PASSWORD"
+print(bcrypt.hashpw(pw, bcrypt.gensalt()).decode())
+PY
+)
     
   sqlite3 "$DB_PATH" "UPDATE settings SET value='$HASHED_PASS' WHERE key='webPassword';" || send_log "step" "4.5" "Failed to update password in database"
 
