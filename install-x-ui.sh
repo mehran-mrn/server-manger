@@ -23,7 +23,7 @@ PORT="16823"
 PANEL_PORT="54321"
 RUN_ID=""
 MODE="auto"
-DEPS="cron wget iptables ufw unzip ca-certificates python3 jq openssl socat curl certbot python3-certbot-dns-cloudflare sqlite3"
+DEPS="cron wget iptables ufw unzip ca-certificates python3 jq openssl socat curl certbot python3-certbot-dns-cloudflare sqlite3 apache2-utils"
 ACME_SH="/root/.acme.sh/acme.sh"
 
 # -------- parse args ----------
@@ -127,14 +127,7 @@ if [ -f "$DB_PATH" ]; then
   # Update panel settings in database
   sqlite3 "$DB_PATH" "UPDATE settings SET value='$PANEL_PORT' WHERE key='webPort';" || send_log "step" "4.5" "Failed to update webPort in database"
   sqlite3 "$DB_PATH" "UPDATE settings SET value='$USERNAME' WHERE key='webUsername';" || send_log "step" "4.5" "Failed to update username in database"
-  
-HASHED_PASS=$(python3 - <<PY
-import bcrypt
-pw = b"$PASSWORD"
-print(bcrypt.hashpw(pw, bcrypt.gensalt()).decode())
-PY
-)
-    
+    HASHED_PASS=$(htpasswd -bnBC 12 "" "$PASSWORD" | tr -d ':\n')   
   sqlite3 "$DB_PATH" "UPDATE settings SET value='$HASHED_PASS' WHERE key='webPassword';" || send_log "step" "4.5" "Failed to update password in database"
 
   # Set other useful defaults
