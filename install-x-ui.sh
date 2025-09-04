@@ -21,6 +21,7 @@ CF_API_TOKEN=""
 CF_PROXIED="false"
 PORT="16823"
 PANEL_PORT="54321"
+PANEL_PASS="admin3"
 RUN_ID=""
 MODE="auto"
 DEPS="cron wget iptables ufw unzip ca-certificates python3 jq openssl socat curl certbot python3-certbot-dns-cloudflare sqlite3 apache2-utils"
@@ -40,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --cf-proxied) CF_PROXIED="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
     --panel-port) PANEL_PORT="$2"; shift 2;;
+    --panel-pass) PANEL_PASS="$2"; shift 2;;
     --run-id) RUN_ID="$2"; shift 2;;
     --mode) MODE="$2"; shift 2;;
     -h|--help) echo "Usage: $0 --webhook-url <url> [--webhook-user user --webhook-pass pass] [--domain ...]"; exit 0;;
@@ -56,7 +58,7 @@ HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
 
 # Generate random username and password for 3X-UI
 USERNAME="admin"
-PASSWORD="$(openssl rand -hex 12)"
+PASSWORD="$PANEL_PASS"
 
 # -------- helper: send log to webhook ----------
 send_log(){
