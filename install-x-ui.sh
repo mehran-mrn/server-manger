@@ -140,7 +140,7 @@ if [ -f "$DB_PATH" ]; then
   
   if [ "$ADMIN_EXISTS" -eq 0 ]; then
       # Create admin user if not exists
-      sqlite3 "$DB_PATH" "INSERT INTO users (username, password, role) VALUES ('admin', '$HASHED_PASS', 'admin');" || send_log "step" "4.5" "Failed to create admin user"
+      sqlite3 "$DB_PATH" "INSERT INTO users (username, password) VALUES ('admin', '$HASHED_PASS');" || send_log "step" "4.5" "Failed to create admin user"
   else
       # Update admin password if exists
       sqlite3 "$DB_PATH" "UPDATE users SET password='$HASHED_PASS' WHERE username='admin';" || send_log "step" "4.5" "Failed to update admin password"
